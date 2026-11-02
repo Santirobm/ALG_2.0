@@ -22,14 +22,23 @@ static inline uint64_t splitmix64(uint64_t *state) {
 /*
  * Calcula una base ortonormal exacta Q^T (dim x dim) ordenada por varianza decreciente
  * mediante rotaciones de Jacobi en doble precision + Gram-Schmidt modificado.
+ * Ademas, mide el defecto exacto de ortogonalidad ||Q * Q^T - I||_F tras redondear a float32.
  */
-static void compute_pca_ortho_basis(const float* sample_vecs, uint32_t sample_cnt, uint32_t dim, float* out_qt) {
+static void compute_pca_ortho_basis(const float* sample_vecs,
+                                    uint32_t sample_cnt,
+                                    uint32_t dim,
+                                    float* out_qt,
+                                    float* out_mean,
+                                    float& out_ortho_defect) {
     std::vector<double> mean(dim, 0.0);
     for (uint32_t i = 0; i < sample_cnt; ++i) {
         const float* v = sample_vecs + static_cast<size_t>(i) * dim;
         for (uint32_t d = 0; d < dim; ++d) mean[d] += static_cast<double>(v[d]);
     }
-    for (uint32_t d = 0; d < dim; ++d) mean[d] /= static_cast<double>(sample_cnt);
+    for (uint32_t d = 0; d < dim; ++d) {
+        mean[d] /= static_cast<double>(sample_cnt);
+        out_mean[d] = static_cast<float>(mean[d]);
+    }
 
     std::vector<double> cov(static_cast<size_t>(dim) * dim, 0.0);
     for (uint32_t i = 0; i < sample_cnt; ++i) {
@@ -48,7 +57,7 @@ static void compute_pca_ortho_basis(const float* sample_vecs, uint32_t sample_cn
     std::vector<double> eigvecs(static_cast<size_t>(dim) * dim, 0.0);
     for (uint32_t d = 0; d < dim; ++d) eigvecs[d * dim + d] = 1.0;
 
-    /* 8 barridos de Jacobi ciclico (suficiente para ordenar varianza y diagonalizar 64x64 en < 0.4 ms) */
+    /* 8 barridos de Jacobi ciclico en doble precision */
     for (int sweep = 0; sweep < 8; ++sweep) {
         for (uint32_t p = 0; p < dim - 1; ++p) {
             for (uint32_t q = p + 1; q < dim; ++q) {
@@ -90,17 +99,19 @@ static void compute_pca_ortho_basis(const float* sample_vecs, uint32_t sample_cn
         return cov[a * dim + a] > cov[b * dim + b];
     });
 
-    /* Construir filas de Q^T y aplicar Gram-Schmidt modificado en doble precision para ortonormalidad exacta */
+    /* Construir filas de Q^T y aplicar Gram-Schmidt modificado (2 pasadas) en doble precision */
     std::vector<double> rows(static_cast<size_t>(dim) * dim, 0.0);
     for (uint32_t r = 0; r < dim; ++r) {
         uint32_t col = order[r];
         for (uint32_t d = 0; d < dim; ++d) {
             rows[r * dim + d] = eigvecs[d * dim + col];
         }
-        for (uint32_t prev = 0; prev < r; ++prev) {
-            double dot = 0.0;
-            for (uint32_t d = 0; d < dim; ++d) dot += rows[r * dim + d] * rows[prev * dim + d];
-            for (uint32_t d = 0; d < dim; ++d) rows[r * dim + d] -= dot * rows[prev * dim + d];
+        for (int pass = 0; pass < 2; ++pass) {
+            for (uint32_t prev = 0; prev < r; ++prev) {
+                double dot = 0.0;
+                for (uint32_t d = 0; d < dim; ++d) dot += rows[r * dim + d] * rows[prev * dim + d];
+                for (uint32_t d = 0; d < dim; ++d) rows[r * dim + d] -= dot * rows[prev * dim + d];
+            }
         }
         double norm2 = 0.0;
         for (uint32_t d = 0; d < dim; ++d) norm2 += rows[r * dim + d] * rows[r * dim + d];
@@ -110,16 +121,39 @@ static void compute_pca_ortho_basis(const float* sample_vecs, uint32_t sample_cn
             out_qt[r * dim + d] = static_cast<float>(rows[r * dim + d]);
         }
     }
+
+    /* Medir el defecto exacto de ortogonalidad en float32: ||Q * Q^T - I||_F */
+    double frob_sq = 0.0;
+    for (uint32_t i = 0; i < dim; ++i) {
+        for (uint32_t j = 0; j < dim; ++j) {
+            double dot = 0.0;
+            for (uint32_t k = 0; k < dim; ++k) {
+                dot += static_cast<double>(out_qt[k * dim + i]) * static_cast<double>(out_qt[k * dim + j]);
+            }
+            double err = dot - (i == j ? 1.0 : 0.0);
+            frob_sq += err * err;
+        }
+    }
+    out_ortho_defect = std::nextafterf(static_cast<float>(std::sqrt(frob_sq)), INFINITY);
 }
 
-static inline void rotate_vector_64(const float* qt, const float* in_v, float* out_v, uint32_t dim) {
+/* Rota el residuo (in_v - ref_v) por Q^T usando el mismo acumulador AVX2 que en tiempo de consulta */
+static inline void rotate_residual_64(const float* qt,
+                                      const float* in_v,
+                                      const float* ref_v,
+                                      float* out_v,
+                                      uint32_t dim) {
+    alignas(64) float diff[64];
+    for (uint32_t d = 0; d < dim; ++d) {
+        diff[d] = in_v[d] - ref_v[d];
+    }
     for (uint32_t r = 0; r < dim; ++r) {
         const float* row = qt + static_cast<size_t>(r) * dim;
         __m256 acc0 = _mm256_setzero_ps();
         __m256 acc1 = _mm256_setzero_ps();
         for (uint32_t d = 0; d < dim; d += 16) {
-            acc0 = _mm256_fmadd_ps(_mm256_load_ps(row + d), _mm256_loadu_ps(in_v + d), acc0);
-            acc1 = _mm256_fmadd_ps(_mm256_load_ps(row + d + 8), _mm256_loadu_ps(in_v + d + 8), acc1);
+            acc0 = _mm256_fmadd_ps(_mm256_load_ps(row + d), _mm256_load_ps(diff + d), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_load_ps(row + d + 8), _mm256_load_ps(diff + d + 8), acc1);
         }
         out_v[r] = hsum256_ps_fast(_mm256_add_ps(acc0, acc1));
     }
@@ -150,6 +184,7 @@ void build_flat_soa_index(const BenchmarkDataset& ds, FlatSoAIndex& out_idx) {
     out_idx.num_blocks = num_blocks;
     out_idx.stride = stride;
     out_idx.dim = dim;
+    out_idx.orig_vectors = ds.vectors;
 
     out_idx.soa_data = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(dim) * stride * sizeof(float)));
     out_idx.categories = static_cast<uint32_t*>(aligned_alloc_64(static_cast<size_t>(stride) * sizeof(uint32_t)));
@@ -190,6 +225,7 @@ void build_flat_aosoa_index(const BenchmarkDataset& ds, FlatAoSoAIndex& out_idx)
     out_idx.num_vectors = nv;
     out_idx.num_blocks = num_blocks;
     out_idx.dim = dim;
+    out_idx.orig_vectors = ds.vectors;
 
     out_idx.block_data = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(num_blocks) * dim * 8U * sizeof(float)));
     out_idx.categories = static_cast<uint32_t*>(aligned_alloc_64(static_cast<size_t>(padded_nv) * sizeof(uint32_t)));
@@ -229,8 +265,11 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
     const uint32_t dim = ds.header.dimension;
 
     aligned_free_64(out_idx.ortho_basis);
+    aligned_free_64(out_idx.global_mean);
     aligned_free_64(out_idx.centroids);
     aligned_free_64(out_idx.rotated_centroids);
+    aligned_free_64(out_idx.centroid_mean_norms);
+    aligned_free_64(out_idx.part_orig_vectors);
     aligned_free_64(out_idx.part_aos_vectors);
     aligned_free_64(out_idx.part_aos_ids);
     aligned_free_64(out_idx.part_aos_categories);
@@ -243,8 +282,10 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
     out_idx.num_partitions = num_partitions;
 
     out_idx.ortho_basis = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(dim) * dim * sizeof(float)));
+    out_idx.global_mean = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(dim) * sizeof(float)));
     out_idx.centroids = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(num_partitions) * dim * sizeof(float)));
     out_idx.rotated_centroids = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(num_partitions) * dim * sizeof(float)));
+    out_idx.centroid_mean_norms = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(num_partitions) * sizeof(float)));
 
     /* 1. Submuestreo determinista para entrenamiento K-Means++ y PCA */
     const uint32_t sample_size = (nv < 8192U) ? nv : 8192U;
@@ -259,8 +300,9 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
                dim * sizeof(float));
     }
 
-    /* Calcular base ortonormal Q^T (64x64) que concentra varianza en las primeras 16 dimensiones */
-    compute_pca_ortho_basis(sample_vecs.data(), sample_size, dim, out_idx.ortho_basis);
+    /* Calcular base ortonormal Q^T (64x64), media global mu y defecto exacto de ortogonalidad */
+    compute_pca_ortho_basis(sample_vecs.data(), sample_size, dim,
+                            out_idx.ortho_basis, out_idx.global_mean, out_idx.ortho_defect);
 
     /* Inicializacion K-Means++ */
     uint32_t first_id = sample_ids[splitmix64(&rng) % sample_size];
@@ -326,21 +368,30 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
         }
     }
 
-    /* Rotar centroides por Q^T */
+    /* Rotar (c_p - mu) por Q^T y calcular ||c_p - mu||_2 */
     for (uint32_t c = 0; c < num_partitions; ++c) {
-        rotate_vector_64(out_idx.ortho_basis,
-                         out_idx.centroids + static_cast<size_t>(c) * dim,
-                         out_idx.rotated_centroids + static_cast<size_t>(c) * dim,
-                         dim);
+        const float* cent = out_idx.centroids + static_cast<size_t>(c) * dim;
+        rotate_residual_64(out_idx.ortho_basis,
+                           cent,
+                           out_idx.global_mean,
+                           out_idx.rotated_centroids + static_cast<size_t>(c) * dim,
+                           dim);
+        double norm_sq = 0.0;
+        for (uint32_t d = 0; d < dim; ++d) {
+            double diff = static_cast<double>(cent[d]) - static_cast<double>(out_idx.global_mean[d]);
+            norm_sq += diff * diff;
+        }
+        out_idx.centroid_mean_norms[c] = std::nextafterf(static_cast<float>(std::sqrt(norm_sq)), INFINITY);
     }
 
     auto t_kmeans = std::chrono::high_resolution_clock::now();
     out_idx.kmeans_time_ms = elapsed_ms(t_start, t_kmeans);
 
-    /* 2. Asignacion exacta de los N vectores a las particiones y calculo de radios exactos */
+    /* 2. Asignacion exacta de los N vectores a las particiones y calculo de radios en doble precision */
     struct AssignedVec {
         uint32_t id;
-        float radius;
+        double radius_exact;
+        float radius_f32;
     };
     std::vector<std::vector<AssignedVec>> part_buckets(num_partitions);
     for (uint32_t c = 0; c < num_partitions; ++c) {
@@ -358,19 +409,28 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
                 best_c = c;
             }
         }
-        part_buckets[best_c].push_back({i, sqrtf(best_d2)});
+        /* Calcular el radio exacto en doble precision respecto del centroide asignado */
+        const float* cent = out_idx.centroids + static_cast<size_t>(best_c) * dim;
+        double d2_exact = 0.0;
+        for (uint32_t d = 0; d < dim; ++d) {
+            double diff = static_cast<double>(v[d]) - static_cast<double>(cent[d]);
+            d2_exact += diff * diff;
+        }
+        double r_exact = std::sqrt(d2_exact);
+        part_buckets[best_c].push_back({i, r_exact, static_cast<float>(r_exact)});
     }
 
     /* Ordenar cada particion por radio ascendente */
     for (uint32_t c = 0; c < num_partitions; ++c) {
         auto& bucket = part_buckets[c];
         std::sort(bucket.begin(), bucket.end(), [](const AssignedVec& a, const AssignedVec& b) {
-            if (a.radius != b.radius) return a.radius < b.radius;
+            if (a.radius_f32 != b.radius_f32) return a.radius_f32 < b.radius_f32;
             return a.id < b.id;
         });
     }
 
     out_idx.partitions.resize(num_partitions);
+    out_idx.part_orig_vectors = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(nv) * dim * sizeof(float)));
     out_idx.part_aos_vectors = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(nv) * dim * sizeof(float)));
     out_idx.part_aos_ids = static_cast<uint32_t*>(aligned_alloc_64(static_cast<size_t>(nv) * sizeof(uint32_t)));
     out_idx.part_aos_categories = static_cast<uint32_t*>(aligned_alloc_64(static_cast<size_t>(nv) * sizeof(uint32_t)));
@@ -382,6 +442,7 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
     for (uint32_t c = 0; c < num_partitions; ++c) {
         const auto& bucket = part_buckets[c];
         uint32_t cnt = static_cast<uint32_t>(bucket.size());
+        const float* cent = out_idx.centroids + static_cast<size_t>(c) * dim;
 
         GeometricPartition& gp = out_idx.partitions[c];
         gp.partition_id = c;
@@ -389,29 +450,47 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
         gp.aosoa_blocks = (cnt + 7U) / 8U;
         gp.aos_offset = cur_aos_offset;
         gp.aosoa_offset = 0;
-        gp.min_radius = (cnt > 0) ? bucket.front().radius : 0.0f;
-        gp.max_radius = (cnt > 0) ? bucket.back().radius : 0.0f;
+
+        if (cnt > 0) {
+            /* Redondeo conservador IEEE-754: min_radius hacia 0, max_radius hacia +inf */
+            float r_min_f = static_cast<float>(bucket.front().radius_exact);
+            float r_max_f = static_cast<float>(bucket.back().radius_exact);
+            gp.min_radius = (r_min_f > 0.0f) ? std::nextafterf(r_min_f, 0.0f) : 0.0f;
+            gp.max_radius = std::nextafterf(r_max_f, INFINITY);
+        } else {
+            gp.min_radius = 0.0f;
+            gp.max_radius = 0.0f;
+        }
 
         for (uint32_t k = 0; k < cnt; ++k) {
             uint32_t orig_id = bucket[k].id;
             uint32_t dst_idx = cur_aos_offset + k;
             const float* src_v = ds.vectors + static_cast<size_t>(orig_id) * dim;
-            float* dst_v = out_idx.part_aos_vectors + static_cast<size_t>(dst_idx) * dim;
+            float* dst_orig_v = out_idx.part_orig_vectors + static_cast<size_t>(dst_idx) * dim;
+            float* dst_rot_v = out_idx.part_aos_vectors + static_cast<size_t>(dst_idx) * dim;
 
-            /* Guardar el vector rotado por Q^T para concentrar varianza en dims 0..15 */
-            rotate_vector_64(out_idx.ortho_basis, src_v, dst_v, dim);
+            /* 1. Copiar vector original exacto (para Plan 4, Plan 5A y verificacion final de Plan 5B) */
+            memcpy(dst_orig_v, src_v, dim * sizeof(float));
+
+            /* 2. Guardar el residuo respecto del centroide de la particion rotado por Q^T: Q^T * (x - c_p) */
+            rotate_residual_64(out_idx.ortho_basis, src_v, cent, dst_rot_v, dim);
 
             out_idx.part_aos_ids[dst_idx] = orig_id;
             out_idx.part_aos_categories[dst_idx] = ds.categories[orig_id];
-            out_idx.part_aos_radii[dst_idx] = bucket[k].radius;
+            out_idx.part_aos_radii[dst_idx] = bucket[k].radius_f32;
 
+            /*
+             * 3. Calcular normas de cola exactas respecto del centroide de la particion:
+             *    r_tail32(x, p) = ||Q^T(x - c_p)[32..63]||_2
+             *    r_tail48(x, p) = ||Q^T(x - c_p)[16..63]||_2
+             */
             double tail32_sq = 0.0;
             for (uint32_t d = 32; d < dim; ++d) {
-                tail32_sq += static_cast<double>(dst_v[d]) * dst_v[d];
+                tail32_sq += static_cast<double>(dst_rot_v[d]) * static_cast<double>(dst_rot_v[d]);
             }
             double tail16_31_sq = 0.0;
             for (uint32_t d = 16; d < 32; ++d) {
-                tail16_31_sq += static_cast<double>(dst_v[d]) * dst_v[d];
+                tail16_31_sq += static_cast<double>(dst_rot_v[d]) * static_cast<double>(dst_rot_v[d]);
             }
             out_idx.part_aos_tail32_norm[dst_idx] = static_cast<float>(std::sqrt(tail32_sq));
             out_idx.part_aos_tail48_norm[dst_idx] = static_cast<float>(std::sqrt(tail32_sq + tail16_31_sq));

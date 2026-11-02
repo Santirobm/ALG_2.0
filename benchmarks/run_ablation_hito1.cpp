@@ -13,51 +13,25 @@
 
 using namespace alg_flat;
 
-static double compute_recall_k(const Neighbor* pred, uint32_t pred_cnt,
-                               const Neighbor* gt, uint32_t gt_cnt, uint32_t k) {
+/*
+ * Recall estricto por ID (Hito 2A Nivel 1: sin tolerancia de distancia en la frontera).
+ */
+static double compute_strict_id_recall_k(const Neighbor* pred, uint32_t pred_cnt,
+                                         const Neighbor* gt, uint32_t gt_cnt, uint32_t k) {
     uint32_t target = (gt_cnt < k) ? gt_cnt : k;
     if (target == 0) return 1.0;
     uint32_t n_p = (pred_cnt < k) ? pred_cnt : k;
-    float kth_gt_dist = gt[target - 1].dist_sq * 1.00001f;
     uint32_t hits = 0;
     for (uint32_t i = 0; i < n_p; ++i) {
-        bool found = false;
         for (uint32_t j = 0; j < target; ++j) {
             if (pred[i].id == gt[j].id) {
-                found = true;
+                hits++;
                 break;
             }
         }
-        if (!found && pred[i].dist_sq <= kth_gt_dist) {
-            found = true;
-        }
-        if (found) hits++;
     }
     return static_cast<double>(hits) / static_cast<double>(target);
 }
-
-struct PlanSummary {
-    std::string scenario;
-    std::string cache_mode;
-    uint32_t top_k;
-    double selectivity_pct;
-    std::string plan_name;
-    double build_ms;
-    double prep_mean_us;
-    double calc_mean_us;
-    double total_mean_us;
-    double total_p50_us;
-    double total_p95_us;
-    double total_p99_us;
-    double mean_cycles;
-    double cycles_per_el_vec;
-    double dists_eval_mean;
-    double pruned_pct;
-    double parts_visited_pct;
-    double bandwidth_gbs;
-    double recall_at_10;
-    double recall_at_k;
-};
 
 int main() {
 #ifdef _WIN32
@@ -66,9 +40,30 @@ int main() {
 #endif
 
     std::cout << "========================================================================================\n";
-    std::cout << "ALG-Flat 2.0 (Hito 1): Ablacion Incremental de Layouts Fisicos, SIMD y Poda Exacta\n";
-    std::cout << "CPU Pinning: P-Core 0 | Vectores: 100,000 | Dim: 64 (float32 = 25.6 MB)\n";
+    std::cout << "ALG-Flat 2.0 (Hito 1 + Certificacion Hito 2A): Benchmark Canonico de Ablacion\n";
+    std::cout << "CPU Pinning: P-Core 0 (AffinityMask=0x1, HIGH_PRIORITY_CLASS)\n";
+    std::cout << "Compilador : " << __VERSION__ << " | Flags: -O3 -march=native -mavx2 -mfma -std=c++17\n";
+    std::cout << "Corpus     : N=100,000 | Dim=64 (float32 = 25.6 MB) | Strict ID Recall (0 tolerancia)\n";
     std::cout << "========================================================================================\n";
+
+    /* Guardar metadatos canonicos de reproduccion */
+    {
+        std::ofstream meta("results/run_metadata.txt");
+        meta << "Project: ALG-Flat 2.0 (Hito 1 + Hito 2A Exactness Audit)\n";
+        meta << "Compiler: " << __VERSION__ << "\n";
+        meta << "Compile_Flags: -O3 -march=native -mavx2 -mfma -std=c++17\n";
+        meta << "CPU: Intel Core i5-13500 (24 MB Intel Smart Cache L3)\n";
+        meta << "OS: Windows 10/11 x86_64\n";
+        meta << "Affinity_Mask: 0x1 (P-Core 0)\n";
+        meta << "Process_Priority: HIGH_PRIORITY_CLASS\n";
+        meta << "Corpus_Vectors: 100000\n";
+        meta << "Dimension: 64 (float32, 25.6 MB raw corpus)\n";
+        meta << "Seed: 8\n";
+        meta << "Warm_Queries: 500 (after 20 warmup queries per plan)\n";
+        meta << "Cold_Queries: 40 (with 36 MB LLC eviction buffer + _mm_mfence before each query)\n";
+        meta << "Plan_Execution_Order: 0_Ref_Hito9 -> 1_Scalar -> 2A_AVX2_1x -> 2B_AVX2_4x -> 3A_SoA -> 3B_AoSoA -> 4_IVF_Flat -> 5A_IVF_PartPrune -> 5B_IVF_FullExactPrune\n";
+        meta << "Recall_Metric: Strict ID Recall (exact ID set membership, tie-break dist_sq ASC, id ASC, 0 distance tolerance)\n";
+    }
 
     struct ScenarioConfig {
         std::string name;
@@ -89,7 +84,7 @@ int main() {
     std::ofstream csv("results/ablation_hito1_summary.csv");
     csv << "Scenario,CacheMode,TopK,SelectivityPct,Plan,BuildTime_ms,PrepMean_us,CalcMean_us,"
         << "TotalMean_us,p50_us,p95_us,p99_us,MeanCycles,CyclesPerEligibleVec,DistsEvaluated,"
-        << "VectorsPrunedPct,PartitionsVisitedPct,EffectiveBW_GBs,Recall10,RecallK\n";
+        << "VectorsPrunedPct,PartitionsVisitedPct,EffectiveBW_GBs,StrictRecall10,StrictRecallK\n";
 
     for (const auto& sc : scenarios) {
         std::cout << "\n########################################################################################\n";
@@ -110,11 +105,10 @@ int main() {
         build_flat_aosoa_index(ds, aosoa_idx);
         build_ivf_partitioned_index(ds, 128, 15, ivf_idx);
 
-        printf("Tiempos de Construccion (ms): AoS=%.2f | SoA=%.2f | AoSoA=%.2f | IVF(P=128)=%.2f (KMeans=%.2f + Layout=%.2f)\n",
+        printf("Tiempos de Construccion (ms): AoS=%.2f | SoA=%.2f | AoSoA=%.2f | IVF(P=128)=%.2f (KMeans=%.2f + Layout=%.2f) | OrthoDefect=%.3e\n",
                aos_idx.build_time_ms, soa_idx.build_time_ms, aosoa_idx.build_time_ms,
-               ivf_idx.total_build_time_ms, ivf_idx.kmeans_time_ms, ivf_idx.layout_time_ms);
+               ivf_idx.total_build_time_ms, ivf_idx.kmeans_time_ms, ivf_idx.layout_time_ms, ivf_idx.ortho_defect);
 
-        /* Evaluar en selectividad 15.0% (seli=2) y 25.0% (seli=6), para TopK=10 y TopK=100, en WARM y COLD */
         struct EvalCondition {
             uint32_t sel_idx;
             uint32_t top_k;
@@ -123,15 +117,14 @@ int main() {
         };
 
         std::vector<EvalCondition> conditions = {
-            {2, 100, false, 500},  /* 15% Sel, K=100, WARM (Comparacion directa con 184 us de Hito 9) */
-            {2, 100, true,  40},   /* 15% Sel, K=100, COLD (Con flush completo de 36 MB LLC) */
+            {2, 100, false, 500},  /* 15% Sel, K=100, WARM */
+            {2, 100, true,  40},   /* 15% Sel, K=100, COLD (36 MB LLC Flush) */
             {2, 10,  false, 500},  /* 15% Sel, K=10,  WARM */
             {0, 100, false, 500},  /* 10% Sel, K=100, WARM */
             {6, 100, false, 500}   /* 25% Sel, K=100, WARM */
         };
 
         for (const auto& cond : conditions) {
-            /* En escenarios secundarios ejecutamos la condicion principal 15% Warm K=100 y K=10 */
             if (sc.name != "R_k64_s009_Base" && (cond.sel_idx != 2)) continue;
 
             uint32_t sel_deci = ds.header.selectivities_deci_percent[cond.sel_idx];
@@ -145,12 +138,12 @@ int main() {
 
             printf("\n--- [%s | %s | Sel=%.1f%% (%u elegibles) | Top-%u | Queries=%u] ---\n",
                    sc.name.c_str(), cmode.c_str(), sel_pct, pred.eligible_count, k, nq);
-            printf("%-30s | %8s | %8s | %8s | %8s | %8s | %7s | %7s | %7s | %6s\n",
+            printf("%-30s | %8s | %8s | %8s | %8s | %8s | %7s | %7s | %7s | %8s\n",
                    "Plan de Ejecucion", "Prep(us)", "Calc(us)", "p50(us)", "p95(us)", "Mean(us)",
-                   "Cyc/Vec", "Pruned%", "BW(GBs)", "R@K(%)");
-            printf("----------------------------------------------------------------------------------------------------------------------------\n");
+                   "Cyc/Vec", "Pruned%", "BW(GBs)", "StrictR%");
+            printf("------------------------------------------------------------------------------------------------------------------------------\n");
 
-            /* Precalcular Ground Truth Exacto con Plan 0 */
+            /* Precalcular Ground Truth Exacto en espacio original con Plan 0 */
             std::vector<std::vector<Neighbor>> gt_all(nq, std::vector<Neighbor>(k));
             std::vector<uint32_t> gt_cnts(nq, 0);
             for (uint32_t q = 0; q < nq; ++q) {
@@ -184,12 +177,11 @@ int main() {
             };
 
             for (int pid = 0; pid < num_plans; ++pid) {
-                /* Warmup (si es modo WARM) */
                 if (!cond.cold_cache) {
                     Neighbor w_out[512];
                     uint32_t w_cnt = 0;
                     QueryExecutionMetrics w_m{};
-                    for (uint32_t w = 0; w < 10; ++w) {
+                    for (uint32_t w = 0; w < 20; ++w) {
                         const float* qv = ds.queries[w].values;
                         if (pid == 0) execute_plan0_ref_hito9(aos_idx, qv, pred, k, w_out, &w_cnt, w_m);
                         else if (pid == 1) execute_plan1_flat_scalar_aos(aos_idx, qv, pred, k, w_out, &w_cnt, w_m);
@@ -237,8 +229,8 @@ int main() {
                     sum_parts_pct += 100.0 * static_cast<double>(m.partitions_visited) / static_cast<double>(m.partitions_total);
                     sum_bytes += static_cast<double>(m.bytes_read);
 
-                    sum_r10 += compute_recall_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], 10);
-                    sum_rk += compute_recall_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], k);
+                    sum_r10 += compute_strict_id_recall_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], 10);
+                    sum_rk += compute_strict_id_recall_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], k);
                 }
 
                 std::sort(tot_lats.begin(), tot_lats.end());
@@ -253,13 +245,13 @@ int main() {
                 double cyc_per_vec = mean_cyc / static_cast<double>(pred.eligible_count);
                 double mean_dists = sum_dists / nq;
                 double pruned_pct = 100.0 * (1.0 - (mean_dists / static_cast<double>(pred.eligible_count)));
-                if (pruned_pct < 0.0) pruned_pct = 0.0; /* Para SoA/AoSoA global que evaluan carriles extra */
+                if (pruned_pct < 0.0) pruned_pct = 0.0;
                 double mean_parts_pct = sum_parts_pct / nq;
                 double bw_gbs = (sum_bytes / nq) / (mean_tot * 1e-6) / 1e9;
                 double r10 = (sum_r10 / nq) * 100.0;
                 double rk = (sum_rk / nq) * 100.0;
 
-                printf("%-30s | %8.1f | %8.1f | %8.1f | %8.1f | %8.1f | %7.1f | %6.1f%% | %7.2f | %6.2f\n",
+                printf("%-30s | %8.1f | %8.1f | %8.1f | %8.1f | %8.1f | %7.1f | %6.1f%% | %7.2f | %7.3f%%\n",
                        plan_names[pid], mean_prep, mean_calc, p50, p95, mean_tot,
                        cyc_per_vec, pruned_pct, bw_gbs, rk);
 
@@ -275,6 +267,6 @@ int main() {
     }
 
     csv.close();
-    std::cout << "\nBenchmark completado con exito. Resultados exportados a results/ablation_hito1_summary.csv\n";
+    std::cout << "\nBenchmark canonico completado. Resultados en results/ablation_hito1_summary.csv y results/run_metadata.txt\n";
     return 0;
 }

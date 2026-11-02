@@ -1,6 +1,6 @@
 # ALG-Flat (ALG 2.0) — Adaptive Geometric Layout Engine
 
-**Exact vector search through physical partitioning, memory layout optimization, exact geometric pruning, and SIMD execution.**
+**Exact vector search through physical partitioning, memory layout optimization, certified geometric pruning, and SIMD execution.**
 
 ---
 
@@ -8,14 +8,14 @@
 
 Tras concluir el Hito 9 del proyecto original (`ALG`), demostramos empíricamente que en regímenes de dimensionalidad moderada ($N = 100.000$, $D = 64$, selectividades del $10\%$ al $25\%$), un escaneo contiguo vectorizado (`ExactScan`) supera sistemáticamente a las arquitecturas basadas en grafos (`HNSW`) y a los despachadores híbridos dinámicos bajo cargas fuera de distribución (*OOD*).
 
-**ALG-Flat (`ALG 2.0`)** nace de una pregunta fundamental:
-> *¿Cuánto rendimiento estamos perdiendo por cómo almacenamos y recorremos físicamente los vectores en memoria, incluso cuando ya elegimos el algoritmo exacto correcto?*
+**ALG-Flat (`ALG 2.0`)** parte de una pregunta diferente:
+> *¿Cuánto trabajo exacto podemos ahorrar mediante organización física de memoria, paralelismo SIMD y cotas geométricas matemáticamente certificadas, sin sacrificar jamás la exactitud del resultado?*
 
-En lugar de sacrificar precisión mediante estructuras aproximadas o pagar el sobrecosto de un selector dinámico, **ALG-Flat** optimiza la ejecución **100% exacta (`float32`, Recall@K = 100.00%)** aislando rigurosamente cuatro ejes físicos:
-1. **Ejecución SIMD e ILP (Instruction-Level Parallelism):** Eliminación de cadenas de dependencia en FMA (latencia de 4 ciclos en Intel Golden Cove), eliminación de `_mm_hadd_ps` y evaluación multi-vectorial simultánea (`4x1 AoS` y `8x1 AoSoA`).
-2. **Organización Física de Memoria:** Comparación controlada entre **AoS** (*Array of Structures*), **SoA** (*Structure of Arrays*) y **AoSoA** (*Array of Structures of Arrays* en bloques transpuestos de $8 \times 64$).
-3. **Particionamiento Físico Geométrico (`IVF-Flat`):** Reutilización de centroides K-Means en *build-time* para agrupar físicamente los vectores en regiones contiguas ordenadas radialmente desde el centroide hacia la periferia.
-4. **Poda Geométrica Exacta (*Exact Geometric Pruning*):** Descarte determinista de particiones, cáscaras esféricas (*radial shells*) y colas dimensionales en base ortonormal PCA sin perder un solo vecino exacto.
+**ALG-Flat** separa y evalúa incrementalmente cuatro ejes físicos en `float32`:
+1. **Ejecución SIMD e ILP (Instruction-Level Parallelism):** Eliminación de cadenas de dependencia en FMA (latencia de 4 ciclos en Intel Golden Cove), reducción horizontal sin `_mm_hadd_ps` y evaluación multi-vectorial simultánea (`4x1 AoS` y `8x1 AoSoA`).
+2. **Organización Física de Memoria:** Comparación controlada entre **AoS** (*Array of Structures*), **SoA** (*Structure of Arrays*) y **AoSoA** (*Array of Structures of Arrays* en bloques transpuestos de $8 \times 64 = 2048\text{ B}$).
+3. **Particionamiento Físico Geométrico (`IVF-Flat` en espacio original):** Agrupación física en $P=128$ particiones K-Means ordenadas por radio ascendente respecto del centroide, visitadas en orden de cercanía a la consulta $q$.
+4. **Poda Geométrica Exacta Conservadora (*Certified Exact Geometric Pruning*):** Descarte determinista de particiones, cáscaras esféricas (*radial shells*) y colas dimensionales en base ortonormal PCA centrada por partición, con **recálculo de distancia final en el espacio original `float32`**.
 
 ---
 
@@ -24,128 +24,144 @@ En lugar de sacrificar precisión mediante estructuras aproximadas o pagar el so
 ```
 ALG_2.0/
 ├── include/
-│   ├── alg_flat_types.h       # TopKHeap estático O(1) rechazo, métricas por fase y ColdCacheEvictor (36 MB)
+│   ├── alg_flat_types.h       # TopKHeap estático con desempate determinista (dist_sq, id) y ColdCacheEvictor (36 MB)
 │   ├── dataset_loader.h       # Generador determinista y cargador binario compatible con Hito 8/9
 │   ├── simd_kernels.h         # Kernels: Scalar estricto, AVX2 AoS (1x1 y 4x1), AVX2 SoA (8x1), AVX2 AoSoA (8x1)
-│   ├── physical_layouts.h     # Estructuras físicas: FlatAoS, FlatSoA, FlatAoSoA e IVFPartitionedIndex (con PCA O(64))
-│   └── execution_plans.h      # Los 9 planes de ejecución de la escalera de ablación
+│   ├── physical_layouts.h     # Estructuras físicas: FlatAoS, FlatSoA, FlatAoSoA e IVFPartitionedIndex
+│   └── execution_plans.h      # Los 9 planes de ejecución + Auditor de Poda de Nivel 3 (PruningAuditReport)
 ├── src/
 │   ├── dataset_loader.cpp     # Generación reproducible bit-a-bit de escenarios R, D y M50/50
-│   ├── physical_layouts.cpp   # K-Means++, diagonalización Jacobi O(64), ordenamiento radial y empaquetado
-│   └── execution_plans.cpp    # Implementación instrumentada con RDTSC y desglose Prep / Calc / Total
+│   ├── physical_layouts.cpp   # K-Means++, Jacobi O(64) + Gram-Schmidt, defecto ||Q*Q^T-I||_F y colas por partición
+│   └── execution_plans.cpp    # Implementación instrumentada con RDTSC, cotas conservadoras IEEE-754 y auditoría
 ├── tests/
-│   └── test_exactness.cpp     # Certificación automática de 100.00% Recall@10 y Recall@100 en los 9 planes
+│   └── test_exactness.cpp     # Certificación Hito 2A en 3 niveles y 4 suites (incluyendo casos adversariales)
 ├── benchmarks/
-│   └── run_ablation_hito1.cpp # Benchmark Warm Cache vs. Cold Cache (LLC Flush) fijado a P-Core 0
+│   └── run_ablation_hito1.cpp # Benchmark canónico Warm Cache vs. Cold Cache (LLC Flush) fijado a P-Core 0
 └── results/
-    └── ablation_hito1_summary.csv
+    ├── ablation_hito1_summary.csv
+    └── run_metadata.txt
 ```
 
 ---
 
-## 🔬 Hito 1: Escalera de Ablación Incremental y Diagnóstico Físico
+## 🛡️ Hito 2A: Auditoría de Exactitud Matemática en 3 Niveles (`tests/test_exactness.cpp`)
 
-Para evitar mezclar técnicas sin poder aislar la contribución de cada una, evaluamos **9 planes de ejecución incrementales** (todos en `float32` con **100.00% de Recall exacto**):
+Antes de construir selectores adaptativos o escalar en tamaño, el **Hito 2A** garantiza que ningún mecanismo de poda pueda descartar un vecino verdadero ni alterar el orden exacto de resultados en aritmética finita IEEE-754 `float32`:
 
-| Plan | Nombre | Qué aísla y descubre |
-| :---: | :--- | :--- |
-| **0** | `0_Ref_Hito9_ExactScan` | Baseline original de Hito 8/9 (`std::priority_queue` + 1 acumulador AVX2 + `_mm_hadd_ps`). |
-| **1** | `1_Flat_Scalar_AoS` | Coste de referencia escalar real (auto-vectorización LLVM deshabilitada) + `TopKHeap` estático. |
-| **2A** | `2A_Flat_AVX2_AoS_1x` | Ganancia pura de SIMD 1x1 (doble acumulador FMA + reducción rápida sin `hadd` + `TopKHeap`). |
-| **2B** | `2B_Flat_AVX2_AoS_4x` | Ganancia de paralelismo a nivel de instrucción (procesa 4 vectores elegibles en paralelo reutilizando registros de `q`). |
-| **3A** | `3A_Flat_AVX2_SoA` | Layout transpuesto global (*Structure of Arrays*, 64 flujos simultáneos). |
-| **3B** | `3B_Flat_AVX2_AoSoA` | Layout transpuesto por bloques (*AoSoA*, bloques contiguos de 8 vectores $\times$ 64 dims = 2 KB). |
-| **4** | `4_IVF_Flat_AVX2` | Ganancia pura del particionamiento físico K-Means ($P=128$, visita ordenada por cercanía a `q`, **sin poda**). |
-| **5A** | `5A_IVF_PartPrune_AVX2` | Ganancia de la poda exacta a nivel de partición por desigualdad triangular: $d(q, c_p) - r_{\max}(p) > \rho_K$. |
-| **5B** | `5B_IVF_FullExactPrune_AVX2` | Poda exacta multi-nivel: Partición + Cáscara Radial $[d_c - \rho_K, d_c + \rho_K]$ + Base Ortogonal PCA $O(64)$ con corte progresivo exacto en 16D/32D. |
+### 1. Formulación Exacta de la Cota PCA Centrada por Partición
+Para cada vector $x$ perteneciente a la partición $p$ con centroide $c_p$, almacenamos el residuo rotado $\tilde{x}_p = \hat{Q}^T(x - c_p)$ y sus normas de cola **respecto del centroide de su partición**:
+$$r^{(48)}_{x,p} = \bigl\|\hat{Q}^T(x - c_p)_{16..63}\bigr\|_2, \qquad r^{(32)}_{x,p} = \bigl\|\hat{Q}^T(x - c_p)_{32..63}\bigr\|_2$$
+En tiempo de consulta, al visitar una partición activa $p$, se obtiene el residuo rotado de la consulta respecto de ese mismo centroide $\tilde{q}_p = \hat{Q}^T(q - \mu) - \hat{Q}^T(c_p - \mu) = \hat{Q}^T(q - c_p)$ y sus normas de cola por partición:
+$$r^{(48)}_{q,p} = \bigl\|\hat{Q}^T(q - c_p)_{16..63}\bigr\|_2, \qquad r^{(32)}_{q,p} = \bigl\|\hat{Q}^T(q - c_p)_{32..63}\bigr\|_2$$
+Por la desigualdad triangular inversa en el subespacio de cola ($s \in \{16, 32\}$):
+$$\bigl\|\tilde{q}_{p, s..63} - \tilde{x}_{p, s..63}\bigr\|_2 \ge \Bigl|\, r^{(64-s)}_{q,p} - r^{(64-s)}_{x,p} \,\Bigr|$$
+Esta formulación es **exactamente invariante a traslaciones de los centroides lejos del origen** ($\|c_p\|_2 \gg 0$) y elimina la cancelación catastrófica en punto flotante.
+
+### 2. Cotas Numéricamente Conservadoras en IEEE-754 `float32`
+* **Defecto de Ortogonalidad Medido:** Al construir $\hat{Q}^T$ en `float32`, se mide en `double` el defecto exacto $\|\hat{Q}\hat{Q}^T - I_{64}\|_F \approx 2.93 \times 10^{-7}$.
+* **Radios Conservadores:** `min_radius` se redondea hacia $0$ (`nextafterf(..., 0.0f)`) y `max_radius` hacia $+\infty$ (`nextafterf(..., INFINITY)`) a partir de normas calculadas en `double`.
+* **Holgura IEEE-754 por Partición (`fp_slack_p`):** Descuenta el error máximo de redondeo FMA de rotación y sustracción antes de elevar al cuadrado la cota de cola.
+* **Distancia Final en Espacio Original:** Todo candidato que sobrevive al filtro en `Plan 5B` (así como todo candidato que supera la compuerta SIMD en `Plan 1..5A`) evalúa su distancia final en el **espacio original `float32`** (`q` contra `part_orig_vectors`) con desempate determinista `(dist_sq ASC, id ASC)`.
+
+### 3. Resultados de los 3 Niveles de Certificación (`test_exactness.exe`)
+| Suite de Certificación | Vectores ($N$) | Consultas ($Q$) | Nivel 1: `StrictID@10` / `@100` (0 tolerancia) | Nivel 1B: `RankMatch%` | Nivel 2: `MaxOrigDistErr` | Nivel 3: Vectores Podados Auditados | Violaciones de Cota ($LB^2 > d_{\text{orig}}^2$) | $\min(d_{\text{orig}}^2 / LB^2)$ |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `1_Full_Benchmark_100k_Mix_s009` | $100.000$ | $100$ | **100.0000%** | **100.0000%** | `0.000e+00` | $1.025.773$ | **0** | $1.087924$ |
+| `2_Adversarial_FarOffOrigin` ($\|c_p\| \gg 0$) | $20.000$ | $80$ | **100.0000%** | **100.0000%** | `0.000e+00` | $230.486$ | **0** | $1.000088$ |
+| `3_Adversarial_Collinear_Tail_And_Ties` | $20.000$ | $60$ | **100.0000%** | **100.0000%** | `0.000e+00` | $111.750$ | **0** | $1.001392$ |
+| `4_Full_Benchmark_100k_Tight_s003` | $100.000$ | $100$ | **100.0000%** | **100.0000%** | `0.000e+00` | $1.459.047$ | **0** | $1.057055$ |
 
 ---
 
-## 📊 Resultados Experimentales (Intel Core i5-13500, P-Core 0)
+## 📊 Resultados Canónicos del Hito 1 + 2A (`results/ablation_hito1_summary.csv`)
 
-### 1. Diagnóstico Térmico de Caché: ¿Por qué `ExactScan` tardaba ~170–184 µs en Hito 9?
-El corpus completo de $100.000 \times 64 \times 4\text{ B}$ ocupa **$25.6\,\text{MB}$**, superando los **$24\,\text{MB}$ de Intel Smart Cache (L3)** del i5-13500. Sin embargo, para una selectividad fija del $15\%$, los $15.077$ vectores elegibles representan exactamente **$3.86\,\text{MB}$**.
-* En **Warm Cache** (consultas sucesivas sobre el mismo predicado), esos $3.86\,\text{MB}$ permanecen calientes en L3, entregando un ancho de banda efectivo de **$23\text{–}30\,\text{GB/s}$** y una latencia de **$168.6\,\mu\text{s}$ (p50)**.
-* En **Cold Cache** (evicción explícita de L3 mediante barrido de $36\,\text{MB}$ + `mfence` antes de cada consulta), `0_Ref_Hito9_ExactScan` sube a **$492\text{–}525\,\mu\text{s}$ (p50)** y el ancho de banda cae a **$7.8\text{–}8.5\,\text{GB/s}$** debido a los accesos indirectos espaciados en DRAM.
+### Metadatos de Reproducción (`results/run_metadata.txt`)
+* **Compilador y Flags:** `Clang 22.1.8` (`zig c++ -O3 -march=native -mavx2 -mfma -std=c++17`)
+* **CPU y Afinidad:** Intel Core i5-13500 ($24\,\text{MB}$ Intel Smart Cache L3), fijado a `P-Core 0` (`AffinityMask=0x1`, `HIGH_PRIORITY_CLASS`)
+* **Corpus y Semilla:** $N = 100.000$, $D = 64$ (`float32`, $25.6\,\text{MB}$), `Seed = 8`
+* **Protocolo de Caché:** `WARM_CACHE` ($500$ consultas tras $20$ consultas de calentamiento por plan) y `COLD_LLC_FLUSH` ($40$ consultas con barrido de $36\,\text{MB}$ + `_mm_mfence` antes de cada consulta)
+* **Métrica de Exactitud:** `Strict ID Recall` ($0$ tolerancia de distancia en la frontera)
 
 ---
 
-### 2. Escenario Base (`R_k64_s009_Base`, $\sigma = 0.09$, Selectividad 15%)
+### 1. Escenario Base (`R_k64_s009_Base`, $\sigma = 0.09$, Selectividad 15%)
 
 #### A. Condición Warm Cache (Top-100 y Top-10)
-| Plan de Ejecución | Top-K | Prep ($\mu$s) | Calc ($\mu$s) | **p50 ($\mu$s)** | p95 ($\mu$s) | Ciclos/Vec | % Podado Exacto | BW Efectivo (GB/s) | Recall@K |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `0_Ref_Hito9_ExactScan` | 100 | 0.0 | 172.0 | **168.6** | 190.7 | 28.4 | 0.0% | 22.79 | 100.00% |
-| `1_Flat_Scalar_AoS` | 100 | 0.0 | 490.7 | **459.6** | 693.6 | 81.2 | 0.0% | 7.99 | 100.00% |
-| `2A_Flat_AVX2_AoS_1x` | 100 | 0.0 | 154.5 | **153.8** | 158.5 | 25.5 | 0.0% | 25.37 | 100.00% |
-| `2B_Flat_AVX2_AoS_4x` | 100 | 0.0 | 144.4 | **142.2** | 146.9 | 23.9 | 0.0% | 27.13 | 100.00% |
-| `3A_Flat_AVX2_SoA` | 100 | 0.0 | 628.8 | **617.2** | 690.7 | 104.0 | 0.0% | 30.18 | 100.00% |
-| `3B_Flat_AVX2_AoSoA` | 100 | 0.0 | 597.8 | **552.5** | 809.5 | 98.9 | 0.0% | 31.75 | 100.00% |
-| `4_IVF_Flat_AVX2` | 100 | 3.5 | 129.5 | **126.5** | 158.0 | 22.0 | 0.0% | 29.46 | 100.00% |
-| `5A_IVF_PartPrune_AVX2` | 100 | 3.5 | 124.1 | **126.4** | 134.5 | 21.1 | 0.0% | 30.72 | 100.00% |
-| **`5B_IVF_FullExactPrune_AVX2`** | **100** | **3.7** | **110.3** | **105.7** | **188.5** | **18.8** | **61.6%** | **13.51** | **100.00%** |
-| `0_Ref_Hito9_ExactScan` | 10 | 0.0 | 141.7 | **140.3** | 145.9 | 23.4 | 0.0% | 27.67 | 100.00% |
-| `2B_Flat_AVX2_AoS_4x` | 10 | 0.0 | 116.4 | **114.9** | 124.6 | 19.2 | 0.0% | 33.68 | 100.00% |
-| **`5B_IVF_FullExactPrune_AVX2`** | **10** | **3.6** | **79.7** | **72.0** | **171.3** | **13.7** | **70.9%** | **14.02** | **100.00%** |
+| Plan de Ejecución | Top-K | Prep ($\mu$s) | Calc ($\mu$s) | **p50 ($\mu$s)** | p95 ($\mu$s) | Mean ($\mu$s) | Ciclos/Vec | % Podado Exacto | BW Efectivo (GB/s) | Strict Recall@K |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `0_Ref_Hito9_ExactScan` | 100 | 0.0 | 171.4 | **168.5** | 201.6 | 171.5 | 28.4 | 0.0% | 22.86 | **100.000%** |
+| `1_Flat_Scalar_AoS` | 100 | 0.0 | 571.4 | **485.4** | 1017.5 | 571.4 | 94.5 | 0.0% | 6.86 | **100.000%** |
+| `2A_Flat_AVX2_AoS_1x` | 100 | 0.0 | 157.6 | **146.3** | 196.9 | 157.6 | 26.1 | 0.0% | 24.87 | **100.000%** |
+| `2B_Flat_AVX2_AoS_4x` | 100 | 0.0 | 146.3 | **132.3** | 184.8 | 146.3 | 24.2 | 0.0% | 26.80 | **100.000%** |
+| `3A_Flat_AVX2_SoA` | 100 | 0.0 | 767.3 | **685.9** | 1165.7 | 767.3 | 126.9 | 0.0% | 24.73 | **100.000%** |
+| `3B_Flat_AVX2_AoSoA` | 100 | 0.0 | 714.2 | **606.8** | 1295.1 | 714.2 | 118.2 | 0.0% | 26.57 | **100.000%** |
+| `4_IVF_Flat_AVX2` | 100 | 3.3 | 138.7 | **141.1** | 177.9 | 142.0 | 23.5 | 0.0% | 27.60 | **100.000%** |
+| **`5A_IVF_PartPrune_AVX2`** | **100** | **3.4** | **123.4** | **113.7** | **167.2** | **126.7** | **20.9** | **0.0%** | **30.93** | **100.000%** |
+| **`5B_IVF_FullExactPrune_AVX2`** | **100** | **3.7** | **132.9** | **116.9** | **255.4** | **136.6** | **22.6** | **66.5%** | **10.05** | **100.000%** |
+| `0_Ref_Hito9_ExactScan` | 10 | 0.0 | 135.6 | **128.1** | 164.9 | 135.6 | 22.4 | 0.0% | 28.91 | **100.000%** |
+| `2B_Flat_AVX2_AoS_4x` | 10 | 0.0 | 111.9 | **101.7** | 151.1 | 111.9 | 18.5 | 0.0% | 35.04 | **100.000%** |
+| `5A_IVF_PartPrune_AVX2` | 10 | 3.4 | 116.1 | **118.6** | 154.4 | 119.4 | 19.7 | 0.3% | 32.74 | **100.000%** |
+| **`5B_IVF_FullExactPrune_AVX2`** | **10** | **3.5** | **89.0** | **77.2** | **194.5** | **92.5** | **15.3** | **74.3%** | **11.32** | **100.000%** |
 
-#### B. Condición Cold Cache (`COLD_LLC_FLUSH`, Top-100)
-| Plan de Ejecución | Prep ($\mu$s) | Calc ($\mu$s) | **p50 ($\mu$s)** | p95 ($\mu$s) | Ciclos/Vec | % Podado Exacto | Recall@100 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `0_Ref_Hito9_ExactScan` | 0.0 | 459.3 | **492.2** | 598.0 | 76.0 | 0.0% | 100.00% |
-| `1_Flat_Scalar_AoS` | 0.0 | 1085.2 | **1057.5** | 1313.6 | 179.6 | 0.0% | 100.00% |
-| `2B_Flat_AVX2_AoS_4x` | 0.0 | 485.3 | **467.8** | 581.2 | 80.3 | 0.0% | 100.00% |
-| `4_IVF_Flat_AVX2` | 7.3 | 466.8 | **450.4** | 636.0 | 78.4 | 0.0% | 100.00% |
-| **`5B_IVF_FullExactPrune_AVX2`** | **7.3** | **317.6** | **309.7** | **545.3** | **53.7** | **67.8%** | **100.00%** |
+#### B. Condición Cold Cache (`COLD_LLC_FLUSH`, Selectividad 15%, Top-100)
+| Plan de Ejecución | Prep ($\mu$s) | Calc ($\mu$s) | **p50 ($\mu$s)** | p95 ($\mu$s) | Mean ($\mu$s) | Ciclos/Vec | % Podado Exacto | Strict Recall@100 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `0_Ref_Hito9_ExactScan` | 0.0 | 712.8 | **681.8** | 1109.5 | 712.8 | 117.9 | 0.0% | **100.000%** |
+| `1_Flat_Scalar_AoS` | 0.0 | 1517.8 | **1368.2** | 2579.5 | 1517.8 | 251.1 | 0.0% | **100.000%** |
+| `2B_Flat_AVX2_AoS_4x` | 0.0 | 538.6 | **498.7** | 918.1 | 538.6 | 89.1 | 0.0% | **100.000%** |
+| `4_IVF_Flat_AVX2` | 7.8 | 571.1 | **564.1** | 889.8 | 578.9 | 95.7 | 0.0% | **100.000%** |
+| `5A_IVF_PartPrune_AVX2` | 7.0 | 495.9 | **473.2** | 789.3 | 502.9 | 83.2 | 0.0% | **100.000%** |
+| **`5B_IVF_FullExactPrune_AVX2`** | **9.5** | **363.5** | **352.8** | **575.2** | **373.0** | **61.7** | **72.4%** | **100.000%** |
+
+#### C. Sensibilidad a la Selectividad en `R_k64_s009_Base` (Warm Cache, Top-100)
+| Selectividad | `0_Ref_Hito9` p50 ($\mu$s) | `4_IVF_Flat` p50 ($\mu$s) | `5A_PartPrune` p50 ($\mu$s) | `5B_FullExactPrune` p50 ($\mu$s) [% Podado] | Mejor Speedup Exacto |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **10.0%** ($10.120$ vecs) | 114.0 | 78.9 | 77.9 | **77.1 $\mu$s** [**64.5%**] | **$1.48\times$** (`5B`) |
+| **15.0%** ($15.077$ vecs) | 168.5 | 141.1 | **113.7 $\mu$s** | **116.9 $\mu$s** [**66.5%**] | **$1.48\times$** (`5A` / `5B`) |
+| **25.0%** ($25.127$ vecs) | 280.6 | 223.3 | 246.0 | **176.0 $\mu$s** [**68.5%**] | **$1.59\times$** (`5B`) |
 
 ---
 
-### 3. Escenario de Alta Localidad (`R_k64_s003_Tight`, $\sigma = 0.03$, Selectividad 15%)
+### 2. Escenario de Alta Localidad (`R_k64_s003_Tight`, $\sigma = 0.03$, Selectividad 15%)
 
-Cuando los clusters tienen menor dispersión intracluster ($\sigma = 0.03$), las cotas geométricas exactas eliminan más del **90% al 97% del trabajo**, reduciendo la latencia en **más de un orden de magnitud** sin perder exactitud:
-
-| Condición | Plan de Ejecución | Prep ($\mu$s) | Calc ($\mu$s) | **p50 ($\mu$s)** | Mean ($\mu$s) | Ciclos/Vec | % Podado Exacto | Speedup (p50) | Recall@K |
+| Condición | Plan de Ejecución | Prep ($\mu$s) | Calc ($\mu$s) | **p50 ($\mu$s)** | Mean ($\mu$s) | Ciclos/Vec | % Podado Exacto | Speedup (p50) | Strict Recall@K |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Warm (Top-100)** | `0_Ref_Hito9_ExactScan` | 0.0 | 170.5 | **169.5** | 170.5 | 28.2 | 0.0% | $1.00\times$ | 100.00% |
-| **Warm (Top-100)** | `4_IVF_Flat_AVX2` (Sin poda) | 3.5 | 127.1 | **126.2** | 130.6 | 21.6 | 0.0% | $1.34\times$ | 100.00% |
-| **Warm (Top-100)** | **`5A_IVF_PartPrune_AVX2`** | 3.0 | 22.1 | **11.9** | 25.1 | 4.1 | **87.2%** | **$14.24\times$** | **100.00%** |
-| **Warm (Top-100)** | **`5B_IVF_FullExactPrune_AVX2`**| 3.1 | 22.3 | **12.2** | 25.4 | 4.2 | **92.0%** | **$13.89\times$** | **100.00%** |
-| **Warm (Top-10)** | `0_Ref_Hito9_ExactScan` | 0.0 | 142.1 | **140.7** | 142.1 | 23.5 | 0.0% | $1.00\times$ | 100.00% |
-| **Warm (Top-10)** | **`5A_IVF_PartPrune_AVX2`** | 3.0 | 14.7 | **6.1** | 17.8 | 2.9 | **88.6%** | **$23.07\times$** | **100.00%** |
-| **Warm (Top-10)** | **`5B_IVF_FullExactPrune_AVX2`**| 3.3 | 13.9 | **6.7** | 17.3 | 2.9 | **93.5%** | **$21.00\times$** | **100.00%** |
-| **Cold (Top-100)** | `0_Ref_Hito9_ExactScan` | 0.0 | 481.1 | **508.7** | 481.1 | 79.6 | 0.0% | $1.00\times$ | 100.00% |
-| **Cold (Top-100)** | **`5A_IVF_PartPrune_AVX2`** | 10.5 | 36.2 | **33.8** | 46.6 | 7.7 | **96.4%** | **$15.05\times$** | **100.00%** |
-| **Cold (Top-100)** | **`5B_IVF_FullExactPrune_AVX2`**| 10.7 | 36.3 | **33.9** | 47.0 | 7.8 | **97.3%** | **$15.01\times$** | **100.00%** |
+| **Warm (Top-100)** | `0_Ref_Hito9_ExactScan` | 0.0 | 168.4 | **167.8** | 168.4 | 27.9 | 0.0% | $1.00\times$ | **100.000%** |
+| **Warm (Top-100)** | `4_IVF_Flat_AVX2` (Sin poda) | 3.8 | 150.0 | **152.5** | 153.8 | 25.4 | 0.0% | $1.10\times$ | **100.000%** |
+| **Warm (Top-100)** | **`5A_IVF_PartPrune_AVX2`** | 3.3 | 31.5 | **13.0** | 34.7 | 5.7 | **87.2%** | **$12.91\times$** | **100.000%** |
+| **Warm (Top-100)** | **`5B_IVF_FullExactPrune_AVX2`**| 3.6 | 30.9 | **17.3** | 34.5 | 5.7 | **95.0%** | **$9.70\times$** | **100.000%** |
+| **Warm (Top-10)** | `0_Ref_Hito9_ExactScan` | 0.0 | 138.9 | **127.0** | 138.9 | 23.0 | 0.0% | $1.00\times$ | **100.000%** |
+| **Warm (Top-10)** | **`5A_IVF_PartPrune_AVX2`** | 3.0 | 17.0 | **6.4** | 20.0 | 3.3 | **88.6%** | **$19.84\times$** | **100.000%** |
+| **Warm (Top-10)** | **`5B_IVF_FullExactPrune_AVX2`**| 3.4 | 15.3 | **8.3** | 18.7 | 3.1 | **96.0%** | **$15.30\times$** | **100.000%** |
+| **Cold (Top-100)** | `0_Ref_Hito9_ExactScan` | 0.0 | 739.8 | **757.2** | 739.8 | 122.4 | 0.0% | $1.00\times$ | **100.000%** |
+| **Cold (Top-100)** | **`5A_IVF_PartPrune_AVX2`** | 9.2 | 39.0 | **34.1** | 48.2 | 8.0 | **96.4%** | **$22.21\times$** | **100.000%** |
+| **Cold (Top-100)** | **`5B_IVF_FullExactPrune_AVX2`**| 12.4 | 58.4 | **46.3** | 70.8 | 11.7 | **97.9%** | **$16.35\times$** | **100.000%** |
 
 ---
 
-### 4. Escenario Adversario Uniforme (`D_k64_s009_Adv`, Consultas Uniformes en $S^{63}$)
+### 3. Escenarios Mixto (`M5050_k64_s009`) y Adversario Uniforme (`D_k64_s009_Adv`, Selectividad 15%)
 
-En una distribución adversaria uniforme en $\mathbb{R}^{64}$, toda consulta $q$ es casi ortogonal a los centroides ($\|q - c_p\|_2 \approx \sqrt{2}$), por lo que la desigualdad triangular a nivel de partición no poda particiones ($0.0\%$). Aun así:
-* **`4_IVF_Flat_AVX2` y `5A_IVF_PartPrune_AVX2`** reducen la latencia de **$169.8\,\mu\text{s}$ a $132.5\,\mu\text{s}$ (p50)** en Top-100 (un **22% más rápido** que el `ExactScan` de Hito 9) gracias al kernel `4x1` y al ordenamiento físico que satura temprano el umbral del `TopKHeap`.
-* En cambio, `5B_IVF_FullExactPrune_AVX2` solo logra podar el $17.1\%$ del trabajo en $D$, pagando $185.6\,\mu\text{s}$ por las comprobaciones progresivas de 16D/32D. Esto demuestra empíricamente por qué **aislar `5A` y `5B`** es indispensable: `5A` nunca degrada en regímenes adversarios (+3.5 $\mu$s de preparación ampliamente compensados por la ganancia de localidad), mientras que el strip-mining de `5B` brilla cuando la poda supera el ~35%.
-
----
-
-### 5. Lección Arquitectónica Clave: AoS vs. SoA vs. AoSoA bajo Filtrado
-
-La comparación de los tres diseños físicos reveló dos fenómenos fundamentales:
-1. **`AoSoA` supera consistentemente a `SoA` entre un 15% y un 28%** tanto en Warm como en Cold Cache, alcanzando hasta **$36.53\,\text{GB/s}$** de ancho de banda efectivo frente a $22\text{–}30\,\text{GB/s}$ de `SoA`. La razón física es que `SoA` abre 64 flujos de memoria simultáneos separados por $400\,\text{KB}$, saturando los descriptores del *hardware prefetcher* L1/L2 y el TLB, mientras que `AoSoA` lee un único flujo contiguo de bloques de $2\,\text{KB}$.
-2. **Dilución de Carriles SIMD (*SIMD Lane Dilution*) en bloques estáticos bajo filtros no correlacionados:** Cuando el filtro tiene selectividad aleatoria $s = 15\%$, la probabilidad de que un bloque estático de 8 vectores en `SoA`/`AoSoA` contenga al menos un vector elegible es $1 - (1 - 0.15)^8 = 72.75\%$. Esto obliga a `SoA`/`AoSoA` estáticos a evaluar el $72.75\%$ del corpus, mientras que **`2B_Flat_AVX2_AoS_4x`** (e **`IVF_Flat_AVX2`**) recolectan dinámicamente 4 vectores elegibles contiguos y los procesan en paralelo sin desperdiciar un solo carril SIMD.
+| Escenario | Condición | `0_Ref_Hito9` p50 ($\mu$s) | `2B_AVX2_4x` p50 ($\mu$s) | `4_IVF_Flat` p50 ($\mu$s) | `5A_PartPrune` p50 ($\mu$s) | `5B_FullPrune` p50 ($\mu$s) [% Podado] | Mejor Plan Exacto |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`M5050_k64_s009`** | Warm (Top-100) | 155.7 | 157.2 | **126.8** | 134.0 | 212.3 [45.5%] | **`4_IVF_Flat`** ($1.23\times$) |
+| **`M5050_k64_s009`** | Cold (Top-100) | 677.4 | **543.6** | 666.4 | 927.1 | **613.5** [37.5%] | **`2B_AVX2_4x`** ($1.25\times$) |
+| **`D_k64_s009_Adv`** | Warm (Top-100) | 159.9 | 145.0 | 122.6 | **119.5** | 211.0 [24.2%] | **`5A_PartPrune`** ($1.34\times$) |
+| **`D_k64_s009_Adv`** | Warm (Top-10) | 127.9 | **100.8** | 120.7 | 120.6 | 188.9 [37.8%] | **`2B_AVX2_4x`** ($1.27\times$) |
 
 ---
 
-## 🛠️ Compilación y Ejecución
+## 🛠️ Compilación y Ejecución Reproducible
 
 ```powershell
-# 1. Test de Exactitud Matemática (100.00% Recall@10 y Recall@100)
-& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\zig.exe" c++ -O3 -std=c++17 -mavx2 -mfma -I include `
-  src/dataset_loader.cpp src/physical_layouts.cpp src/execution_plans.cpp tests/test_exactness.cpp `
-  -o tests/test_exactness.exe
-.\tests\test_exactness.exe
+# 1. Ejecutar la Auditoria Estricta de Exactitud Hito 2A (3 Niveles, 4 Suites)
+& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\zig.exe" c++ -O3 -march=native -mavx2 -mfma -std=c++17 `
+    tests/test_exactness.cpp src/dataset_loader.cpp src/physical_layouts.cpp src/execution_plans.cpp `
+    -o test_exactness.exe
+.\test_exactness.exe
 
-# 2. Benchmark de Ablación Hito 1 (Warm Cache & Cold LLC Flush)
-& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\zig.exe" c++ -O3 -std=c++17 -mavx2 -mfma -I include `
-  src/dataset_loader.cpp src/physical_layouts.cpp src/execution_plans.cpp benchmarks/run_ablation_hito1.cpp `
-  -o benchmarks/run_ablation_hito1.exe
-.\benchmarks\run_ablation_hito1.exe
+# 2. Ejecutar el Benchmark Canonico de Ablacion (Warm Cache + Cold LLC Flush)
+& "$env:LOCALAPPDATA\Microsoft\WinGet\Links\zig.exe" c++ -O3 -march=native -mavx2 -mfma -std=c++17 `
+    benchmarks/run_ablation_hito1.cpp src/dataset_loader.cpp src/physical_layouts.cpp src/execution_plans.cpp `
+    -o run_ablation_hito1.exe
+.\run_ablation_hito1.exe
 ```

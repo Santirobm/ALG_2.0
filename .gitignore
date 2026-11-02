@@ -1,0 +1,26 @@
+# Binaries and build artifacts
+*.exe
+*.pdb
+*.obj
+*.o
+*.ilk
+*.exp
+*.lib
+*.dll
+
+# Large binary datasets
+*.bin
+
+# Compressed archives
+*.zip
+*.tar.gz
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE and OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

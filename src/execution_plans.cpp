@@ -1884,4 +1884,169 @@ void audit_plan6_adaptive_soundness(const IVFPartitionedIndex& idx,
     run_plan6_adaptive_unified_core<true>(idx, q, pred, k, heap, dummy_metrics, nullptr, audit_obs);
 }
 
+void evaluate_single_partition_5a(const IVFPartitionedIndex& idx,
+                                  const float* q,
+                                  uint32_t pid,
+                                  float lb_part_sq,
+                                  const QueryPredicate& pred,
+                                  uint32_t k,
+                                  TopKHeap& heap,
+                                  PartitionStepMetrics& out_met) {
+    memset(&out_met, 0, sizeof(out_met));
+    out_met.part_id = pid;
+
+    const uint32_t* part_offs = idx.eligible_part_offsets_per_sel[pred.sel_index].data();
+    uint32_t e_start = part_offs[pid];
+    uint32_t e_end = part_offs[pid + 1];
+    out_met.cand_count = e_end - e_start;
+    if (e_start >= e_end) return;
+
+    if (heap.size == k && lb_part_sq > heap.threshold_sq) {
+        out_met.pruned_by_part = true;
+        return;
+    }
+
+    const uint32_t* el_ivf_ids = idx.eligible_ivf_ids_per_sel[pred.sel_index].data();
+    uint32_t quarter_evals = 0;
+    uint32_t parts_visited = 0;
+    uint64_t total_bytes = 0;
+    NoOpPruneObserver noop_obs;
+
+    LARGE_INTEGER freq, c0, c1;
+    QueryPerformanceFrequency(&freq);
+    _mm_lfence();
+    QueryPerformanceCounter(&c0);
+    _mm_lfence();
+
+    eval_partition_5a_step<false>(
+        idx, q, el_ivf_ids, e_start, e_end, lb_part_sq,
+        k, heap, quarter_evals, parts_visited, total_bytes, noop_obs
+    );
+
+    _mm_lfence();
+    QueryPerformanceCounter(&c1);
+    _mm_lfence();
+
+    out_met.time_ns = static_cast<double>((c1.QuadPart - c0.QuadPart) * 1000000000ULL) / static_cast<double>(freq.QuadPart);
+    out_met.dists_evaluated = (quarter_evals + 2) / 4;
+}
+
+void evaluate_single_partition_5b(const IVFPartitionedIndex& idx,
+                                  const float* q,
+                                  const float* q_rot,
+                                  float q_mean_norm,
+                                  uint32_t pid,
+                                  float dc_low,
+                                  float dc_high,
+                                  float lb_part_sq,
+                                  const QueryPredicate& pred,
+                                  uint32_t k,
+                                  TopKHeap& heap,
+                                  PartitionStepMetrics& out_met) {
+    memset(&out_met, 0, sizeof(out_met));
+    out_met.part_id = pid;
+
+    const uint32_t* part_offs = idx.eligible_part_offsets_per_sel[pred.sel_index].data();
+    uint32_t e_start = part_offs[pid];
+    uint32_t e_end = part_offs[pid + 1];
+    out_met.cand_count = e_end - e_start;
+    if (e_start >= e_end) return;
+
+    if (heap.size == k && lb_part_sq > heap.threshold_sq) {
+        out_met.pruned_by_part = true;
+        return;
+    }
+
+    const GeometricPartition& gp = idx.partitions[pid];
+    const uint32_t* el_ivf_ids = idx.eligible_ivf_ids_per_sel[pred.sel_index].data();
+
+    LARGE_INTEGER freq, c0, c1;
+    QueryPerformanceFrequency(&freq);
+    _mm_lfence();
+    QueryPerformanceCounter(&c0);
+    _mm_lfence();
+
+    float r_low = 0.0f, r_high = 0.0f, r_pad = 0.0f;
+    compute_radial_shell_interval(dc_low, dc_high, gp.max_radius, heap.threshold_sq, r_low, r_high, r_pad);
+
+    if (r_low > gp.min_radius) {
+        uint32_t lo = e_start, hi = e_end;
+        while (lo < hi) {
+            uint32_t mid = lo + ((hi - lo) >> 1);
+            if (idx.part_aos_radii[el_ivf_ids[mid]] < r_low) lo = mid + 1;
+            else hi = mid;
+        }
+        e_start = lo;
+    }
+    if (r_high < gp.max_radius && e_start < e_end) {
+        uint32_t lo = e_start, hi = e_end;
+        while (lo < hi) {
+            uint32_t mid = lo + ((hi - lo) >> 1);
+            if (idx.part_aos_radii[el_ivf_ids[mid]] <= r_high) lo = mid + 1;
+            else hi = mid;
+        }
+        e_end = lo;
+    }
+
+    uint32_t quarter_evals = 0;
+    uint64_t total_bytes = 0;
+    NoOpPruneObserver noop_obs;
+
+    if (e_start < e_end) {
+        alignas(64) float q_rot_p[64];
+        const float* rot_c = idx.rotated_centroids + static_cast<size_t>(pid) * 64U;
+        __m256 v_tail16_31 = _mm256_setzero_ps();
+        __m256 v_tail32_63 = _mm256_setzero_ps();
+
+        for (uint32_t d = 0; d < 16; d += 8) {
+            __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+            _mm256_store_ps(q_rot_p + d, diff);
+        }
+        for (uint32_t d = 16; d < 32; d += 8) {
+            __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+            _mm256_store_ps(q_rot_p + d, diff);
+            v_tail16_31 = _mm256_fmadd_ps(diff, diff, v_tail16_31);
+        }
+        for (uint32_t d = 32; d < 64; d += 8) {
+            __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+            _mm256_store_ps(q_rot_p + d, diff);
+            v_tail32_63 = _mm256_fmadd_ps(diff, diff, v_tail32_63);
+        }
+
+        float qt32_sq = hsum256_ps_fast(v_tail32_63);
+        float qt16_31_sq = hsum256_ps_fast(v_tail16_31);
+        float q_tail32_p = sqrtf(qt32_sq);
+        float q_tail48_p = sqrtf(qt32_sq + qt16_31_sq);
+
+        PartitionCertifiedBounds bounds = compute_partition_certified_bounds(
+            q_mean_norm, idx.centroid_mean_norms[pid], dc_high, gp.max_radius, idx.ortho_defect
+        );
+
+        uint32_t e = e_start;
+        for (; e + 4 <= e_end; e += 4) {
+            eval_4x_pca_progressive_unified<false>(
+                q, q_rot_p, q_tail48_p, q_tail32_p,
+                bounds, idx,
+                el_ivf_ids[e], el_ivf_ids[e + 1], el_ivf_ids[e + 2], el_ivf_ids[e + 3],
+                heap, quarter_evals, total_bytes, noop_obs
+            );
+        }
+        for (; e < e_end; ++e) {
+            eval_1x_pca_progressive_unified<false>(
+                q, q_rot_p, q_tail48_p, q_tail32_p,
+                bounds, idx,
+                el_ivf_ids[e],
+                heap, quarter_evals, total_bytes, noop_obs
+            );
+        }
+    }
+
+    _mm_lfence();
+    QueryPerformanceCounter(&c1);
+    _mm_lfence();
+
+    out_met.time_ns = static_cast<double>((c1.QuadPart - c0.QuadPart) * 1000000000ULL) / static_cast<double>(freq.QuadPart);
+    out_met.dists_evaluated = (quarter_evals + 2) / 4;
+}
+
 } // namespace alg_flat

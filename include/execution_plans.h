@@ -204,6 +204,41 @@ void audit_plan6_adaptive_soundness(const IVFPartitionedIndex& idx,
                                     uint32_t true_topk_count,
                                     PruningAuditReport& report);
 
+/*
+ * Evaluacion de una sola particion (Hito 2B.2.1 Oracle de Particion):
+ * Ejecuta de forma aislada sobre la particion pid la logica de 5A o 5B
+ * manteniendo intacto el estado del heap Top-K.
+ */
+struct PartitionStepMetrics {
+    uint32_t part_id;
+    uint32_t cand_count;
+    bool pruned_by_part;
+    uint32_t dists_evaluated;
+    double time_ns;
+};
+
+void evaluate_single_partition_5a(const IVFPartitionedIndex& idx,
+                                  const float* q,
+                                  uint32_t pid,
+                                  float lb_part_sq,
+                                  const QueryPredicate& pred,
+                                  uint32_t k,
+                                  TopKHeap& heap,
+                                  PartitionStepMetrics& out_met);
+
+void evaluate_single_partition_5b(const IVFPartitionedIndex& idx,
+                                  const float* q,
+                                  const float* q_rot,
+                                  float q_mean_norm,
+                                  uint32_t pid,
+                                  float dc_low,
+                                  float dc_high,
+                                  float lb_part_sq,
+                                  const QueryPredicate& pred,
+                                  uint32_t k,
+                                  TopKHeap& heap,
+                                  PartitionStepMetrics& out_met);
+
 } // namespace alg_flat
 
 #endif // ALG_FLAT_EXECUTION_PLANS_H

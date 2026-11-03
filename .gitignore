@@ -12,6 +12,7 @@
 # Large binary datasets
 *.bin
 data/**/*.f32
+data/**/*.u32
 data/**/*.jsonl
 !data/**/manifest.json
 

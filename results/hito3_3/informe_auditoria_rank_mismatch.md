@@ -2,40 +2,40 @@
 
 **Fecha:** 3 de Noviembre de 2026  
 **Rama Git:** `hito3.3.1-benchmark-integrity`  
-**Objetivo:** Análisis a nivel de bit del caso con `StrictRankMatch = 99.00%` detectado en embeddings reales ($D=64$, Top-100, Selectividad 10%, COLD).
+**Objetivo:** Análisis a nivel de bit y palabras hexadecimales IEEE 754 del caso con `StrictRankMatch = 99.00%` detectado en embeddings reales ($D=64$, Top-100, Selectividad 10%, COLD).
 
 ---
 
-## 1. Identificación y Parámetros de la Consulta
-- **Archivo ejecutor:** [`benchmarks/realworld/audit_rank_mismatch.cpp`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/benchmarks/realworld/audit_rank_mismatch.cpp).
+## 1. Identificación de la Consulta y Candidatos
+- **Archivo ejecutor de auditoría:** [`benchmarks/realworld/inspect_hex_bits.cpp`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/benchmarks/realworld/inspect_hex_bits.cpp).
 - **Consulta:** Índice relativo `#65` de la serie COLD (`q_idx = 165` del dataset global).
-- **Parámetros:** $K = 100$, Selectividad = 10% (9.000 candidatos elegibles de 90.000).
-- **Resultado Global de Vecindad:** `IDSetRecall = 100.00%` (exactamente los mismos 100 IDs recuperados por ALG y por el oráculo Ground Truth en `double`).
+- **Candidatos discrepantes:** Vector `A` (`id=50563`) y Vector `B` (`id=80871`) en las posiciones 89 y 90 del Top-100.
+- **Resultado Global de Vecindad:** `IDSetRecall = 100.00%` (los 100 vecinos recuperados son idénticos).
 
 ---
 
-## 2. Evidencia Numérica Extraída
+## 2. Inspección Hexadecimal Bit a Bit (Palabras IEEE 754)
 
-La única discrepancia en el ranking de los 100 vecinos ocurrió en las posiciones contiguas **89 y 90**:
+Se evaluó la acumulación de distancias cuadradas sobre los mismos vectores en tres rutas de ejecución:
 
-| Motor / Oráculo | Rango 89 | Rango 90 | Distancia binary64 | Distancia float32 |
+| Modo de Cómputo | Candidato A (ID: 50563) | Candidato B (ID: 80871) | Diferencia Hexadecimal | Diferencia Numérica |
 | :--- | :---: | :---: | :---: | :---: |
-| **Oráculo Ground Truth (binary64)** | **ID: 80871** | **ID: 50563** | `d²(80871) = 1.0741607358890903` <br> `d²(50563) = 1.0741608335483388` | `1.0741607` <br> `1.0741608` |
-| **ALG Plan 5A (float32 AVX2)** | **ID: 50563** | **ID: 80871** | `d² = 1.0741608335483388` | `1.07416081` |
-
-### Métricas de Precisión:
-- **Diferencia real en 64 bits (binary64):**
-  $$\Delta d^2 = |d^2(80871) - d^2(50563)| = 9.765924846583118 \times 10^{-8}$$
-- **Épsilon de máquina float32 ($\epsilon_{mach}$):**
-  $$\epsilon_{mach} = 2^{-23} \approx 1.1920928955 \times 10^{-7}$$
-- **Comparación con el límite numérico:**
-  $$\Delta d^2 = 9.766 \times 10^{-8} < \epsilon_{mach} \approx 1.192 \times 10^{-7}$$
+| **Double binary64 (Oráculo)** | `1.0741608335483388`<br>`0x3ff12fc3452bbf58` | `1.0741607358890903`<br>`0x3ff12fc32af4a7ad` | Distintas en bits de mantisa 25..52 | $\Delta d^2 = 9.7659 \times 10^{-8}$ |
+| **Float32 AVX2 FMA (ALG Plan 5A)** | `1.07416081`<br>**`0x3f897e1a`** | `1.07416081`<br>**`0x3f897e1a`** | **COINCIDENCIA EXACTA BIT A BIT** | **0 ULP (Empate estricto)** |
+| **Float32 Escalar (sin FMA)** | `1.07416081`<br>`0x3f897e1a` | `1.07416070`<br>`0x3f897e19` | Diferencia en bit menos significativo | 1 ULP ($\approx 1.192 \times 10^{-7}$) |
 
 ---
 
-## 3. Dictamen Causal
+## 3. Resolución Definitiva del Mecanismo Causal
 
-1. **Separación Sub-Épsilon:** La distancia euclídea al cuadrado entre los dos vectores en el espacio de 64 dimensiones difiere en menos de **1 Unidad en el Último Lugar (ULP)** de precisión de punto flotante de simple precisión ($float32$).
-2. **Colapso a Valor Idéntico:** Al ser computada en registros vectoriales $float32$, ambas distancias colapsan exactamente al mismo valor cuantizado: `1.07416081`.
-3. **Desempate por ID:** El oráculo binary64 ordena primero `80871` porque su distancia es $9.76 \times 10^{-8}$ menor. Sin embargo, en el acumulador de 32 bits de ALG (y de cualquier motor que utilice IEEE 754 float32), al existir un empate estricto hasta el bit 23 de mantisa, el orden se resuelve por comparación de ID o inserción en el heap.
-4. **Conclusión:** Queda matemáticamente demostrado que la discrepancia posicional no constituye un error algorítmico, omisión de candidatos ni fallo de ordenación, sino un empate numérico infranqueable para la representación de 32 bits.
+1. **Empate Estricto en el Kernel AVX2 de Plan 5A:**
+   El kernel vectorizado de Plan 5A emplea instrucciones fusionadas `_mm256_fmadd_ps` (FMA). Debido a que FMA realiza un único redondeo final en lugar de redondeos intermedios en la multiplicación y suma, el cálculo de la distancia cuadrada euclídea para ambos candidatos produce **exactamente la misma palabra binaria de 32 bits: `0x3f897e1a`**.
+   
+2. **Origen de la Aparente Discrepancia en la Tabla:**
+   La visualización de `1.0741607` vs `1.0741608` provenía de la rutina auxiliar de verificación escalar que realizaba sumas no fusionadas (`mul + add` por separado), cruzando la frontera de redondeo en 1 ULP (`0x3f897e19` vs `0x3f897e1a`). En el hardware AVX2 real de ALG Plan 5A, **la distancia almacenada en el heap para ambos candidatos es idéntica bit a bit**.
+
+3. **Desempate por ID vs Desempate Binary64:**
+   - Para el oráculo de 64 bits (`double`), el Candidato B (`80871`) es menor por $9.7659 \times 10^{-8}$, ubicándose en el rango 89.
+   - Para ALG Plan 5A (AVX2), ambas distancias son `0x3f897e1a`. Al detectar igualdad numérica estricta, la política de inserción del heap desempata por orden de inserción/ID, colocando primero al Candidato A (`50563`).
+
+**Conclusión:** Se certifica empíricamente que la permutación posicional en la consulta #65 no es un error de ordenamiento ni de aproximación, sino un **empate binario exacto (0 ULP)** en la precisión $float32$ del hardware AVX2.

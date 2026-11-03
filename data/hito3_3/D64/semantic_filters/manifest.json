@@ -1,0 +1,27 @@
+{
+  "kind": "synthetic_embedding_correlated_filter_labels",
+  "not_real_business_metadata": true,
+  "method": "MiniBatchKMeans fit on corpus only; held-out queries assigned to frozen centroids",
+  "clusters": 128,
+  "seed": 3311,
+  "corpus_rows": 90000,
+  "query_rows": 10000,
+  "dimension": 64,
+  "filter_records": 30000,
+  "files": {
+    "corpus_cluster_ids.u32": {
+      "sha256": "c4ab64106a110dbe20732c0ad15c0c20a0b57eb041800cca3ac712ec21cabe39",
+      "bytes": 360000
+    },
+    "query_cluster_ids.u32": {
+      "sha256": "d43961a342ce85713d793064f26bf7e350998c59be9605c9cd1d4bb1d64d49a3",
+      "bytes": 40000
+    },
+    "query_cluster_filters.jsonl": {
+      "sha256": "40448e3ec715d8455cf8722356e3afcf4106676f9e89cd401d902104c0475031",
+      "bytes": 8857797
+    }
+  },
+  "cluster_size_min": 294,
+  "cluster_size_max": 1787
+}

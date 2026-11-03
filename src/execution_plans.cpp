@@ -2049,4 +2049,158 @@ void evaluate_single_partition_5b(const IVFPartitionedIndex& idx,
     out_met.dists_evaluated = (quarter_evals + 2) / 4;
 }
 
+void execute_oracle_plan_end_to_end(
+    const IVFPartitionedIndex& idx,
+    const float* q,
+    const uint32_t* sorted_pids,
+    const float* sorted_lb_part_sq,
+    const float* sorted_dc_low,
+    const float* sorted_dc_high,
+    const uint8_t* decision_5b_mask,
+    bool oracle_needs_pca_rot,
+    const QueryPredicate& pred,
+    uint32_t k,
+    Neighbor* out_results,
+    uint32_t* out_count,
+    double& out_total_us) {
+
+    LARGE_INTEGER freq, c0, c1;
+    QueryPerformanceFrequency(&freq);
+    _mm_lfence();
+    QueryPerformanceCounter(&c0);
+    _mm_lfence();
+
+    const uint32_t n_parts = idx.num_partitions;
+    const uint32_t dim = idx.dim;
+    const uint32_t* el_ivf_ids = idx.eligible_ivf_ids_per_sel[pred.sel_index].data();
+    const uint32_t* part_offs = idx.eligible_part_offsets_per_sel[pred.sel_index].data();
+
+    alignas(64) float q_rot[64];
+    float q_mean_norm = 0.0f;
+    if (oracle_needs_pca_rot) {
+        alignas(64) float diff[64];
+        double norm_sq = 0.0;
+        for (uint32_t d = 0; d < dim; ++d) {
+            diff[d] = q[d] - idx.global_mean[d];
+            norm_sq += static_cast<double>(diff[d]) * diff[d];
+        }
+        q_mean_norm = round_up_f32(sqrt_up_f64(norm_sq));
+        for (uint32_t r = 0; r < dim; ++r) {
+            const float* row = idx.ortho_basis + static_cast<size_t>(r) * dim;
+            float sum = 0.0f;
+            for (uint32_t c = 0; c < dim; ++c) sum += row[c] * diff[c];
+            q_rot[r] = sum;
+        }
+    }
+
+    TopKHeap heap;
+    heap.init(k);
+    uint32_t dummy_q = 0;
+    uint32_t dummy_v = 0;
+    uint64_t dummy_b = 0;
+    NoOpPruneObserver noop_obs;
+
+    for (uint32_t pi = 0; pi < n_parts; ++pi) {
+        uint32_t pid = sorted_pids[pi];
+        uint32_t e_start = part_offs[pid];
+        uint32_t e_end = part_offs[pid + 1];
+        if (e_start >= e_end) continue;
+
+        float lb_p = sorted_lb_part_sq[pi];
+        if (heap.size == k && lb_p > heap.threshold_sq) {
+            continue;
+        }
+
+        if (decision_5b_mask[pi] == 0) {
+            eval_partition_5a_step<false>(
+                idx, q, el_ivf_ids, e_start, e_end, lb_p,
+                k, heap, dummy_q, dummy_v, dummy_b, noop_obs
+            );
+        } else {
+            const GeometricPartition& gp = idx.partitions[pid];
+            float dc_low = sorted_dc_low[pi];
+            float dc_high = sorted_dc_high[pi];
+            float r_low = 0.0f, r_high = 0.0f, r_pad = 0.0f;
+            compute_radial_shell_interval(dc_low, dc_high, gp.max_radius, heap.threshold_sq, r_low, r_high, r_pad);
+
+            uint32_t b_start = e_start, b_end = e_end;
+            if (r_low > gp.min_radius) {
+                uint32_t lo = b_start, hi = b_end;
+                while (lo < hi) {
+                    uint32_t mid = lo + ((hi - lo) >> 1);
+                    if (idx.part_aos_radii[el_ivf_ids[mid]] < r_low) lo = mid + 1;
+                    else hi = mid;
+                }
+                b_start = lo;
+            }
+            if (r_high < gp.max_radius && b_start < b_end) {
+                uint32_t lo = b_start, hi = b_end;
+                while (lo < hi) {
+                    uint32_t mid = lo + ((hi - lo) >> 1);
+                    if (idx.part_aos_radii[el_ivf_ids[mid]] <= r_high) lo = mid + 1;
+                    else hi = mid;
+                }
+                b_end = lo;
+            }
+
+            if (b_start < b_end) {
+                alignas(64) float q_rot_p[64];
+                const float* rot_c = idx.rotated_centroids + static_cast<size_t>(pid) * 64U;
+                __m256 v_tail16_31 = _mm256_setzero_ps();
+                __m256 v_tail32_63 = _mm256_setzero_ps();
+                for (uint32_t d = 0; d < 16; d += 8) {
+                    __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+                    _mm256_store_ps(q_rot_p + d, diff);
+                }
+                for (uint32_t d = 16; d < 32; d += 8) {
+                    __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+                    _mm256_store_ps(q_rot_p + d, diff);
+                    v_tail16_31 = _mm256_fmadd_ps(diff, diff, v_tail16_31);
+                }
+                for (uint32_t d = 32; d < 64; d += 8) {
+                    __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+                    _mm256_store_ps(q_rot_p + d, diff);
+                    v_tail32_63 = _mm256_fmadd_ps(diff, diff, v_tail32_63);
+                }
+                float qt32_sq = hsum256_ps_fast(v_tail32_63);
+                float qt16_31_sq = hsum256_ps_fast(v_tail16_31);
+                float q_tail32_p = sqrtf(qt32_sq);
+                float q_tail48_p = sqrtf(qt32_sq + qt16_31_sq);
+
+                PartitionCertifiedBounds bounds = compute_partition_certified_bounds(
+                    q_mean_norm, idx.centroid_mean_norms[pid], dc_high, gp.max_radius, idx.ortho_defect
+                );
+
+                uint32_t be = b_start;
+                for (; be + 4 <= b_end; be += 4) {
+                    eval_4x_pca_progressive_unified<false>(
+                        q, q_rot_p, q_tail48_p, q_tail32_p,
+                        bounds, idx,
+                        el_ivf_ids[be], el_ivf_ids[be+1], el_ivf_ids[be+2], el_ivf_ids[be+3],
+                        heap, dummy_q, dummy_b, noop_obs
+                    );
+                }
+                for (; be < b_end; ++be) {
+                    eval_1x_pca_progressive_unified<false>(
+                        q, q_rot_p, q_tail48_p, q_tail32_p,
+                        bounds, idx,
+                        el_ivf_ids[be],
+                        heap, dummy_q, dummy_b, noop_obs
+                    );
+                }
+            }
+        }
+    }
+
+    heap.sort_ascending();
+    *out_count = heap.size;
+    memcpy(out_results, heap.data, heap.size * sizeof(Neighbor));
+
+    _mm_lfence();
+    QueryPerformanceCounter(&c1);
+    _mm_lfence();
+
+    out_total_us = static_cast<double>((c1.QuadPart - c0.QuadPart) * 1000000ULL) / static_cast<double>(freq.QuadPart);
+}
+
 } // namespace alg_flat

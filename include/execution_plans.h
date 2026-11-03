@@ -239,6 +239,26 @@ void evaluate_single_partition_5b(const IVFPartitionedIndex& idx,
                                   TopKHeap& heap,
                                   PartitionStepMetrics& out_met);
 
+/*
+ * Ejecucion End-to-End continua del Plan Oracle de Particiones (Hito 2B.2.2):
+ * Reproduce la secuencia contrafactual optima decidida previamente sin cronometros
+ * intermedios por particion, midiendo el tiempo total real de extremo a extremo.
+ */
+void execute_oracle_plan_end_to_end(
+    const IVFPartitionedIndex& idx,
+    const float* q,
+    const uint32_t* sorted_pids,
+    const float* sorted_lb_part_sq,
+    const float* sorted_dc_low,
+    const float* sorted_dc_high,
+    const uint8_t* decision_5b_mask,
+    bool oracle_needs_pca_rot,
+    const QueryPredicate& pred,
+    uint32_t k,
+    Neighbor* out_results,
+    uint32_t* out_count,
+    double& out_total_us);
+
 } // namespace alg_flat
 
 #endif // ALG_FLAT_EXECUTION_PLANS_H

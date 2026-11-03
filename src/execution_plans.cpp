@@ -380,17 +380,54 @@ void execute_plan3b_flat_avx2_aosoa(const FlatAoSoAIndex& idx,
 }
 
 /*
- * Fallback seguro de ExactScan sobre el layout particionado IVF cuando las precondiciones
- * IEEE-754 (MXCSR o rango de coordenadas) no se cumplen en tiempo de consulta.
+ * Gestor formal de contrato IEEE-754 ante condiciones no nominales en tiempo de consulta:
+ * Separa estrictamente las 3 situaciones identificadas en la auditoria de Hito 2A.3:
+ *   1. Corpus / Indice invalido (`!idx.certified_Contract_valid || idx.num_vectors == 0`):
+ *      Rechaza explicitamente la consulta (`query_rejected = 1`, `status = REJECTED_INVALID_CORPUS_INDEX`).
+ *   2. Consulta no procesable con garantias (`NaN`, `Inf` o `|q_d| > CANONICAL_FALLBACK_MAX_COORD_ABS = 1e18`):
+ *      Rechaza explicitamente la consulta (`query_rejected = 1`, `status = REJECTED_UNSAFE_QUERY_DOMAIN`)
+ *      porque incluso `ExactScan` podria desbordar a `Inf`/`NaN` y romper el orden total del heap.
+ *   3. MXCSR alterado (`FTZ=1`, `DAZ=1` o redondeo != Nearest-Even) y/o consulta finita fuera del
+ *      dominio certificado de poda pero dentro del dominio seguro de fallback (`1e15 < |q_d| <= 1e18`):
+ *      Desactiva toda poda geometrica, restaura temporalmente un entorno MXCSR canonico mediante
+ *      `CanonicalMxcsrScope` (devolviendo el MXCSR original del hilo al salir), ejecuta `ExactScan`
+ *      verificando que toda distancia sea finita (< FLT_MAX), y registra `fallback_triggered = 1`.
  */
-static void execute_ivf_exact_scan_fallback(const IVFPartitionedIndex& idx,
-                                            const float* q,
-                                            const QueryPredicate& pred,
-                                            uint32_t k,
-                                            Neighbor* out_results,
-                                            uint32_t* out_count,
-                                            QueryExecutionMetrics& metrics,
-                                            TimerScope& ts) {
+static void handle_ivf_non_nominal_contract_or_fallback(const IVFPartitionedIndex& idx,
+                                                        const float* q,
+                                                        const QueryPredicate& pred,
+                                                        uint32_t k,
+                                                        Neighbor* out_results,
+                                                        uint32_t* out_count,
+                                                        QueryExecutionMetrics& metrics,
+                                                        TimerScope& ts,
+                                                        bool mxcsr_was_valid) {
+    /* Situacion 1: Corpus / indice invalido rechazado en construccion */
+    if (!idx.certified_Contract_valid || idx.num_vectors == 0U || idx.dim != 64U || !idx.part_orig_vectors) {
+        *out_count = 0U;
+        metrics.fallback_triggered = 0U;
+        metrics.query_rejected = 1U;
+        metrics.status = QueryExecutionStatus::REJECTED_INVALID_CORPUS_INDEX;
+        ts.mark_prep_done();
+        ts.stop(metrics);
+        return;
+    }
+
+    /* Establecer entorno MXCSR canonico temporal y restaurar automaticamente al salir */
+    CanonicalMxcsrScope mxcsr_guard;
+
+    /* Situacion 2: Verificar si la consulta puede evaluarse en ExactScan sin overflow ni NaN/Inf */
+    if (!check_query_canonical_fallback_safe(q, idx.dim)) {
+        *out_count = 0U;
+        metrics.fallback_triggered = 0U;
+        metrics.query_rejected = 1U;
+        metrics.status = QueryExecutionStatus::REJECTED_UNSAFE_QUERY_DOMAIN;
+        ts.mark_prep_done();
+        ts.stop(metrics);
+        return;
+    }
+
+    /* Situacion 3: Fallback ExactScan bajo entorno MXCSR canonico y dominio finito seguro */
     ts.mark_prep_done();
 
     TopKHeap heap;
@@ -404,6 +441,14 @@ static void execute_ivf_exact_scan_fallback(const IVFPartitionedIndex& idx,
     for (uint32_t e = 0; e < n_el; ++e) {
         uint32_t iv = el_ivf_ids[e];
         float d_orig = l2_hito9_ref(q, base_orig + static_cast<size_t>(iv) * dim, dim);
+        if (!std::isfinite(d_orig) || d_orig >= FLT_MAX) {
+            *out_count = 0U;
+            metrics.fallback_triggered = 0U;
+            metrics.query_rejected = 1U;
+            metrics.status = QueryExecutionStatus::REJECTED_UNSAFE_QUERY_DOMAIN;
+            ts.stop(metrics);
+            return;
+        }
         heap.push(idx.part_aos_ids[iv], d_orig);
     }
 
@@ -418,6 +463,10 @@ static void execute_ivf_exact_scan_fallback(const IVFPartitionedIndex& idx,
     metrics.partitions_total = idx.num_partitions;
     metrics.bytes_read = static_cast<uint64_t>(n_el) * (dim * sizeof(float) + sizeof(uint32_t));
     metrics.fallback_triggered = 1U;
+    metrics.query_rejected = 0U;
+    metrics.status = (!mxcsr_was_valid)
+                   ? QueryExecutionStatus::FALLBACK_MXCSR_RESTORED
+                   : QueryExecutionStatus::FALLBACK_QUERY_OUT_OF_CERT_DOMAIN;
 }
 
 /*
@@ -567,13 +616,15 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
     const uint32_t dim = idx.dim;
     const uint32_t n_parts = idx.num_partitions;
 
-    /* Validacion del contrato de ejecucion IEEE-754: MXCSR + dominio finito de la consulta */
+    /* Validacion del contrato de ejecucion IEEE-754: indice valido + MXCSR + dominio de la consulta */
+    const bool mxcsr_ok = check_ieee754_mxcsr_state();
     if (!idx.certified_Contract_valid ||
-        !check_ieee754_mxcsr_state() ||
+        !mxcsr_ok ||
         !check_vector_domain_certified(q, dim)) {
-        execute_ivf_exact_scan_fallback(idx, q, pred, k, out_results, out_count, metrics, ts);
+        handle_ivf_non_nominal_contract_or_fallback(idx, q, pred, k, out_results, out_count, metrics, ts, mxcsr_ok);
         return;
     }
+    metrics.status = QueryExecutionStatus::OK_CERTIFIED;
 
     PartitionOrder p_order[512];
     for (uint32_t p = 0; p < n_parts; ++p) {
@@ -1119,13 +1170,15 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
     TimerScope ts;
     ts.start();
 
-    /* Validacion del contrato de ejecucion IEEE-754: MXCSR + dominio finito de la consulta */
+    /* Validacion del contrato de ejecucion IEEE-754: indice valido + MXCSR + dominio de la consulta */
+    const bool mxcsr_ok = check_ieee754_mxcsr_state();
     if (!idx.certified_Contract_valid ||
-        !check_ieee754_mxcsr_state() ||
+        !mxcsr_ok ||
         !check_vector_domain_certified(q, idx.dim)) {
-        execute_ivf_exact_scan_fallback(idx, q, pred, k, out_results, out_count, metrics, ts);
+        handle_ivf_non_nominal_contract_or_fallback(idx, q, pred, k, out_results, out_count, metrics, ts, mxcsr_ok);
         return;
     }
+    metrics.status = QueryExecutionStatus::OK_CERTIFIED;
 
     TopKHeap heap;
     NoOpPruneObserver noop_obs;

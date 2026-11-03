@@ -29,6 +29,95 @@ using namespace alg_flat;
  *      o no finita (`INFINITY` / `NaN`), `check_vector_domain_certified()` rechaza la poda
  *      certificada y activa el fallback a ExactScan.
  */
+/*
+ * ============================================================================
+ * ORACULO DE PRECISION EXTENDIDA DE 106 BITS (DEKKER/KNUTH DOUBLE-DOUBLE + FMA)
+ * ============================================================================
+ * En la ABI de Windows x86_64 (MSVC / Clang-MSVC), `long double` tiene el mismo
+ * ancho de mantisa que `double` (`LDBL_MANT_DIG == 53`). Para disponer de un
+ * oraculo verdaderamente independiente y de mayor precision que `binary64` en
+ * cualquier sistema operativo, implementamos aritmetica exacta `DoubleDouble`
+ * (`dd106`, 106 bits de mantisa = 2 x 53 bits, u_106 = 2^-106 = 2.465e-32)
+ * basada en las transformaciones libres de error (Error-Free Transformations):
+ *   - `two_sum(a, b)` de Knuth (1969): s + e = a + b exacto.
+ *   - `two_prod(a, b)` con FMA IEEE-754 de hardware (`std::fma`): p + e = a * b exacto.
+ */
+struct dd106 {
+    double hi;
+    double lo;
+
+    constexpr dd106(double h = 0.0, double l = 0.0) : hi(h), lo(l) {}
+};
+
+static inline dd106 dd_two_sum(double a, double b) {
+    double s = a + b;
+    double v = s - a;
+    double e = (a - (s - v)) + (b - v);
+    return {s, e};
+}
+
+static inline dd106 dd_quick_two_sum(double a, double b) {
+    double s = a + b;
+    double e = b - (s - a);
+    return {s, e};
+}
+
+static inline dd106 dd_two_prod(double a, double b) {
+    double p = a * b;
+    double e = std::fma(a, b, -p);
+    return {p, e};
+}
+
+static inline dd106 dd_add(dd106 a, dd106 b) {
+    dd106 s = dd_two_sum(a.hi, b.hi);
+    dd106 t = dd_two_sum(a.lo, b.lo);
+    s.lo += t.hi;
+    s = dd_quick_two_sum(s.hi, s.lo);
+    s.lo += t.lo;
+    return dd_quick_two_sum(s.hi, s.lo);
+}
+
+static inline dd106 dd_sub(dd106 a, dd106 b) {
+    return dd_add(a, dd106(-b.hi, -b.lo));
+}
+
+static inline dd106 dd_mul(dd106 a, dd106 b) {
+    dd106 p = dd_two_prod(a.hi, b.hi);
+    p.lo += a.hi * b.lo + a.lo * b.hi;
+    return dd_quick_two_sum(p.hi, p.lo);
+}
+
+static inline dd106 dd_div(dd106 a, dd106 b) {
+    double q1 = a.hi / b.hi;
+    dd106 r = dd_sub(a, dd_mul(b, dd106(q1, 0.0)));
+    double q2 = r.hi / b.hi;
+    r = dd_sub(r, dd_mul(b, dd106(q2, 0.0)));
+    double q3 = r.hi / b.hi;
+    dd106 q = dd_quick_two_sum(q1, q2);
+    return dd_add(q, dd106(q3, 0.0));
+}
+
+static inline dd106 dd_sqrt(dd106 a) {
+    if (a.hi <= 0.0) return {0.0, 0.0};
+    dd106 x(std::sqrt(a.hi), 0.0);
+    /* Dos iteraciones de Newton-Raphson en precision de 106 bits: x = 0.5 * (x + a / x) */
+    x = dd_mul(dd106(0.5, 0.0), dd_add(x, dd_div(a, x)));
+    x = dd_mul(dd106(0.5, 0.0), dd_add(x, dd_div(a, x)));
+    return x;
+}
+
+/* Devuelve true si a >= b en precision extendida de 106 bits */
+static inline bool dd_ge(dd106 a, dd106 b) {
+    dd106 diff = dd_sub(a, b);
+    return (diff.hi > 0.0) || (diff.hi == 0.0 && diff.lo >= 0.0);
+}
+
+/* Devuelve true si a <= b en precision extendida de 106 bits */
+static inline bool dd_le(dd106 a, dd106 b) {
+    dd106 diff = dd_sub(a, b);
+    return (diff.hi < 0.0) || (diff.hi == 0.0 && diff.lo <= 0.0);
+}
+
 static void verify_directed_rounding_and_interval_oracle() {
     assert(check_ieee754_mxcsr_state() &&
            "El estado MXCSR inicial del proceso debe cumplir Round-to-Nearest-Even, FTZ=0, DAZ=0!");
@@ -43,21 +132,23 @@ static void verify_directed_rounding_and_interval_oracle() {
         {0.0,  0.0,  1.0, 1.0}       /* Casos con norma cero */
     };
 
-    const long double u32_ld = 5.9604644775390625e-8L;
-    auto gamma_ld = [&](uint32_t n) -> long double {
-        long double nu = static_cast<long double>(n) * u32_ld;
-        return nu / (1.0L - nu);
+    const dd106 u32_dd(IEEE754_F32_U, 0.0);
+    const dd106 one_dd(1.0, 0.0);
+    auto gamma_dd = [&](uint32_t n) -> dd106 {
+        dd106 nu = dd_mul(dd106(static_cast<double>(n), 0.0), u32_dd);
+        return dd_div(nu, dd_sub(one_dd, nu));
     };
 
-    const long double g17_ld = gamma_ld(17);
-    const long double g33_ld = gamma_ld(33);
-    const long double g64_ld = gamma_ld(64);
-    const long double g66_ld = gamma_ld(66);
-    const long double g67_ld = gamma_ld(67);
+    const dd106 g17_dd = gamma_dd(17);
+    const dd106 g33_dd = gamma_dd(33);
+    const dd106 g64_dd = gamma_dd(64);
+    const dd106 g66_dd = gamma_dd(66);
+    const dd106 g67_dd = gamma_dd(67);
 
-    const long double coeff_q_ld = 8.0L * g64_ld * (1.0L + u32_ld) + 4.0L * u32_ld;
-    const long double coeff_c_ld = 4.0L * u32_ld;
-    const long double coeff_x_ld = 2.0L * u32_ld;
+    const dd106 coeff_q_dd = dd_add(dd_mul(dd106(8.0, 0.0), dd_mul(g64_dd, dd_add(one_dd, u32_dd))),
+                                    dd_mul(dd106(4.0, 0.0), u32_dd));
+    const dd106 coeff_c_dd = dd_mul(dd106(4.0, 0.0), u32_dd);
+    const dd106 coeff_x_dd = dd_mul(dd106(2.0, 0.0), u32_dd);
 
     for (int s = 0; s < 10; ++s) {
         for (int r = 0; r < 4; ++r) {
@@ -73,39 +164,41 @@ static void verify_directed_rounding_and_interval_oracle() {
 
             PartitionCertifiedBounds b = compute_partition_certified_bounds(q_norm, c_norm, dc_hi, r_max, def);
 
-            long double q_ld   = static_cast<long double>(q_norm);
-            long double c_ld   = static_cast<long double>(c_norm);
-            long double dc_ld  = static_cast<long double>(dc_hi);
-            long double rm_ld  = static_cast<long double>(r_max);
-            long double def_ld = static_cast<long double>(def);
+            dd106 q_dd(static_cast<double>(q_norm), 0.0);
+            dd106 c_dd(static_cast<double>(c_norm), 0.0);
+            dd106 dc_dd(static_cast<double>(dc_hi), 0.0);
+            dd106 rm_dd(static_cast<double>(r_max), 0.0);
+            dd106 def_dd(static_cast<double>(def), 0.0);
 
-            long double delta_vec_oracle = coeff_q_ld * q_ld + coeff_c_ld * c_ld + coeff_x_ld * rm_ld;
-            assert(static_cast<long double>(b.delta_vec_p) >= delta_vec_oracle &&
-                   "Oraculo fallo: delta_vec_p debe ser >= delta_vec_oracle!");
+            dd106 delta_vec_oracle = dd_add(dd_add(dd_mul(coeff_q_dd, q_dd), dd_mul(coeff_c_dd, c_dd)),
+                                            dd_mul(coeff_x_dd, rm_dd));
+            assert(dd_ge(dd106(static_cast<double>(b.delta_vec_p), 0.0), delta_vec_oracle) &&
+                   "Oraculo 106-bit fallo: delta_vec_p debe ser >= delta_vec_oracle!");
 
-            long double dv_ld = static_cast<long double>(b.delta_vec_p);
-            long double tail_err_oracle = g64_ld * (dc_ld + dv_ld) + u32_ld * rm_ld;
-            long double fp_slack_oracle = (1.0L + 4.0L * u32_ld) * (dv_ld + tail_err_oracle);
-            assert(static_cast<long double>(b.fp_slack_p) >= fp_slack_oracle &&
-                   "Oraculo fallo: fp_slack_p debe ser >= fp_slack_oracle!");
+            dd106 dv_dd(static_cast<double>(b.delta_vec_p), 0.0);
+            dd106 tail_err_oracle = dd_add(dd_mul(g64_dd, dd_add(dc_dd, dv_dd)), dd_mul(u32_dd, rm_dd));
+            dd106 fp_slack_oracle = dd_mul(dd_add(one_dd, dd_mul(dd106(4.0, 0.0), u32_dd)),
+                                           dd_add(dv_dd, tail_err_oracle));
+            assert(dd_ge(dd106(static_cast<double>(b.fp_slack_p), 0.0), fp_slack_oracle) &&
+                   "Oraculo 106-bit fallo: fp_slack_p debe ser >= fp_slack_oracle!");
 
-            long double max_vec_oracle = std::sqrt(1.0L + def_ld) * (dc_ld + rm_ld) + dv_ld;
-            long double base_sq_oracle = 2.0L * dv_ld * max_vec_oracle;
-            assert(static_cast<long double>(b.sq_slack_16_p) >= base_sq_oracle * (1.0L + g17_ld) &&
-                   "Oraculo fallo: sq_slack_16_p debe ser >= cota exacta 16D!");
-            assert(static_cast<long double>(b.sq_slack_32_p) >= base_sq_oracle * (1.0L + g33_ld) &&
-                   "Oraculo fallo: sq_slack_32_p debe ser >= cota exacta 32D!");
-            assert(static_cast<long double>(b.sq_slack_64_p) >= base_sq_oracle * (1.0L + g67_ld) &&
-                   "Oraculo fallo: sq_slack_64_p debe ser >= cota exacta 64D!");
+            dd106 max_vec_oracle = dd_add(dd_mul(dd_sqrt(dd_add(one_dd, def_dd)), dd_add(dc_dd, rm_dd)), dv_dd);
+            dd106 base_sq_oracle = dd_mul(dd106(2.0, 0.0), dd_mul(dv_dd, max_vec_oracle));
+            assert(dd_ge(dd106(static_cast<double>(b.sq_slack_16_p), 0.0), dd_mul(base_sq_oracle, dd_add(one_dd, g17_dd))) &&
+                   "Oraculo 106-bit fallo: sq_slack_16_p debe ser >= cota exacta 16D!");
+            assert(dd_ge(dd106(static_cast<double>(b.sq_slack_32_p), 0.0), dd_mul(base_sq_oracle, dd_add(one_dd, g33_dd))) &&
+                   "Oraculo 106-bit fallo: sq_slack_32_p debe ser >= cota exacta 32D!");
+            assert(dd_ge(dd106(static_cast<double>(b.sq_slack_64_p), 0.0), dd_mul(base_sq_oracle, dd_add(one_dd, g67_dd))) &&
+                   "Oraculo 106-bit fallo: sq_slack_64_p debe ser >= cota exacta 64D!");
 
-            long double common_num_ld = (1.0L - g66_ld) * (1.0L - 6.0L * u32_ld);
-            long double den_ld = 1.0L + def_ld;
-            assert(static_cast<long double>(b.scale_safe_16) <= (common_num_ld * (1.0L - g17_ld)) / den_ld &&
-                   "Oraculo fallo: scale_safe_16 debe ser <= factor exacto 16D!");
-            assert(static_cast<long double>(b.scale_safe_32) <= (common_num_ld * (1.0L - g33_ld)) / den_ld &&
-                   "Oraculo fallo: scale_safe_32 debe ser <= factor exacto 32D!");
-            assert(static_cast<long double>(b.scale_safe_64) <= (common_num_ld * (1.0L - g67_ld)) / den_ld &&
-                   "Oraculo fallo: scale_safe_64 debe ser <= factor exacto 64D!");
+            dd106 common_num_dd = dd_mul(dd_sub(one_dd, g66_dd), dd_sub(one_dd, dd_mul(dd106(6.0, 0.0), u32_dd)));
+            dd106 den_dd = dd_add(one_dd, def_dd);
+            assert(dd_le(dd106(static_cast<double>(b.scale_safe_16), 0.0), dd_div(dd_mul(common_num_dd, dd_sub(one_dd, g17_dd)), den_dd)) &&
+                   "Oraculo 106-bit fallo: scale_safe_16 debe ser <= factor exacto 16D!");
+            assert(dd_le(dd106(static_cast<double>(b.scale_safe_32), 0.0), dd_div(dd_mul(common_num_dd, dd_sub(one_dd, g33_dd)), den_dd)) &&
+                   "Oraculo 106-bit fallo: scale_safe_32 debe ser <= factor exacto 32D!");
+            assert(dd_le(dd106(static_cast<double>(b.scale_safe_64), 0.0), dd_div(dd_mul(common_num_dd, dd_sub(one_dd, g67_dd)), den_dd)) &&
+                   "Oraculo 106-bit fallo: scale_safe_64 debe ser <= factor exacto 64D!");
 
             assert(b.sq_slack_16_p <= b.sq_slack_32_p && b.sq_slack_32_p <= b.sq_slack_64_p &&
                    "Monotonia de holgura cuadratica por etapa (16D <= 32D <= 64D) violada!");
@@ -116,36 +209,50 @@ static void verify_directed_rounding_and_interval_oracle() {
             float d2_f32 = dc_hi * dc_hi;
             float r_min  = r_max * 0.25f;
             PartitionDistanceBounds pdb = compute_partition_distance_bounds(d2_f32, r_min, r_max);
-            long double d2_ld = static_cast<long double>(d2_f32);
-            long double dc_true_low  = std::sqrt(d2_ld * (1.0L - g66_ld));
-            long double dc_true_high = std::sqrt(d2_ld / (1.0L - g66_ld));
-            assert(static_cast<long double>(pdb.dc_low) <= dc_true_low &&
-                   "Oraculo fallo: dc_low debe ser <= dc_true_low!");
-            assert(static_cast<long double>(pdb.dc_high) >= dc_true_high &&
-                   "Oraculo fallo: dc_high debe ser >= dc_true_high!");
+            dd106 d2_dd(static_cast<double>(d2_f32), 0.0);
+            dd106 one_m_g66_dd = dd_sub(one_dd, g66_dd);
+            dd106 dc_true_low  = dd_sqrt(dd_mul(d2_dd, one_m_g66_dd));
+            dd106 dc_true_high = dd_sqrt(dd_div(d2_dd, one_m_g66_dd));
+            assert(dd_le(dd106(static_cast<double>(pdb.dc_low), 0.0), dc_true_low) &&
+                   "Oraculo 106-bit fallo: dc_low debe ser <= dc_true_low!");
+            assert(dd_ge(dd106(static_cast<double>(pdb.dc_high), 0.0), dc_true_high) &&
+                   "Oraculo 106-bit fallo: dc_high debe ser >= dc_true_high!");
 
             float r_low = 0.0f, r_high = 0.0f, r_pad = 0.0f;
             float thresh_sq = (r_max * 0.5f) * (r_max * 0.5f);
             compute_radial_shell_interval(pdb.dc_low, pdb.dc_high, r_max, thresh_sq, r_low, r_high, r_pad);
-            long double rho_oracle = std::sqrt(static_cast<long double>(thresh_sq) / (1.0L - g66_ld));
-            long double r_pad_oracle = u32_ld * rm_ld;
-            assert(static_cast<long double>(r_pad) >= r_pad_oracle &&
-                   "Oraculo fallo: r_pad debe ser >= r_pad_oracle!");
-            long double r_low_oracle = std::max(0.0L, static_cast<long double>(pdb.dc_low) - rho_oracle - static_cast<long double>(r_pad));
-            long double r_high_oracle = static_cast<long double>(pdb.dc_high) + rho_oracle + static_cast<long double>(r_pad);
-            assert(static_cast<long double>(r_low) <= r_low_oracle &&
-                   "Oraculo fallo: r_low debe ser <= r_low_oracle!");
-            assert(static_cast<long double>(r_high) >= r_high_oracle &&
-                   "Oraculo fallo: r_high debe ser >= r_high_oracle!");
+            dd106 rho_oracle = dd_sqrt(dd_div(dd106(static_cast<double>(thresh_sq), 0.0), one_m_g66_dd));
+            dd106 r_pad_oracle = dd_mul(u32_dd, rm_dd);
+            assert(dd_ge(dd106(static_cast<double>(r_pad), 0.0), r_pad_oracle) &&
+                   "Oraculo 106-bit fallo: r_pad debe ser >= r_pad_oracle!");
+            dd106 raw_low_dd = dd_sub(dd_sub(dd106(static_cast<double>(pdb.dc_low), 0.0), rho_oracle),
+                                      dd106(static_cast<double>(r_pad), 0.0));
+            dd106 r_low_oracle = (raw_low_dd.hi > 0.0) ? raw_low_dd : dd106(0.0, 0.0);
+            dd106 r_high_oracle = dd_add(dd_add(dd106(static_cast<double>(pdb.dc_high), 0.0), rho_oracle),
+                                         dd106(static_cast<double>(r_pad), 0.0));
+            assert(dd_le(dd106(static_cast<double>(r_low), 0.0), r_low_oracle) &&
+                   "Oraculo 106-bit fallo: r_low debe ser <= r_low_oracle!");
+            assert(dd_ge(dd106(static_cast<double>(r_high), 0.0), r_high_oracle) &&
+                   "Oraculo 106-bit fallo: r_high debe ser >= r_high_oracle!");
         }
     }
 }
 
 /*
- * Verifica que cuando el contrato de entorno IEEE-754 se viola en tiempo de ejecucion
- * (p. ej. otro componente activa FTZ/DAZ o cambia el modo de redondeo en MXCSR, o una
- * consulta trae coordenadas fuera de rango / no finitas), los Planes 5A y 5B lo detectan
- * y conmutan de inmediato al fallback seguro ExactScan sin perder exactitud.
+ * Verifica las 5 situaciones formales del contrato de entorno IEEE-754 y dominio:
+ *   1. Ejecucion nominal (`OK_CERTIFIED`).
+ *   2. `MXCSR` alterado (`FTZ=1` + redondeo != Nearest-Even): desactiva la poda, restaura
+ *      temporalmente `MXCSR` canonico durante `ExactScan`, devuelve el `MXCSR` del llamador
+ *      intacto al salir y preserva `RankMatch@K = 100%`.
+ *   3. Consulta finita fuera del dominio certificado de poda (`2.0e16f > 1.0e15f`), pero dentro
+ *      del dominio seguro de fallback (`<= 1.0e18f`): ejecuta `ExactScan` sin overflow y preserva
+ *      `RankMatch@K = 100%` contra Ground Truth.
+ *   4. Consulta no procesable con garantias (`1.0e20f > 1.0e18f` que desbordaria `ExactScan`,
+ *      `INFINITY` y `NAN`): rechaza explicitamente la consulta (`query_rejected == 1`, `cnt == 0`,
+ *      `status == REJECTED_UNSAFE_QUERY_DOMAIN`).
+ *   5. Corpus invalido en construccion (`1.0e20f` o `NAN` en el corpus): `build_ivf_partitioned_index`
+ *      rechaza construir el indice (`return false`, `certified_Contract_valid == false`), y cualquier
+ *      consulta sobre dicho indice es rechazada con `status == REJECTED_INVALID_CORPUS_INDEX`.
  */
 static void verify_runtime_environment_and_domain_contract() {
     BenchmarkDataset ds;
@@ -154,8 +261,9 @@ static void verify_runtime_environment_and_domain_contract() {
     FlatAoSIndex aos_idx;
     IVFPartitionedIndex ivf_idx;
     build_flat_aos_index(ds, aos_idx);
-    build_ivf_partitioned_index(ds, 16, 8, ivf_idx);
-    assert(ivf_idx.certified_Contract_valid && "El indice IVF base debe ser valido bajo contrato IEEE-754!");
+    bool build_ok = build_ivf_partitioned_index(ds, 16, 8, ivf_idx);
+    assert(build_ok && ivf_idx.certified_Contract_valid &&
+           "El indice IVF base debe construirse y ser valido bajo contrato IEEE-754!");
 
     const uint32_t sel_idx = 2;
     const uint32_t target_cat = ds.header.selectivities_deci_percent[sel_idx] * 10U;
@@ -170,47 +278,112 @@ static void verify_runtime_environment_and_domain_contract() {
     const float* qv = ds.queries[0].values;
     execute_plan0_ref_hito9(aos_idx, qv, pred, k, gt, &gt_cnt, m_gt);
 
-    /* Caso 1: Estado nominal MXCSR -> fallback_triggered == 0 */
+    /* Caso 1: Estado nominal MXCSR -> OK_CERTIFIED */
     execute_plan5a_ivf_part_prune_avx2(ivf_idx, qv, pred, k, out5a, &cnt5a, m5a);
     execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, qv, pred, k, out5b, &cnt5b, m5b);
     assert(m5a.fallback_triggered == 0U && m5b.fallback_triggered == 0U &&
-           "En estado MXCSR nominal no debe activarse el fallback!");
+           m5a.query_rejected == 0U && m5b.query_rejected == 0U &&
+           m5a.status == QueryExecutionStatus::OK_CERTIFIED &&
+           m5b.status == QueryExecutionStatus::OK_CERTIFIED &&
+           "En estado MXCSR nominal debe ejecutarse con OK_CERTIFIED!");
 
-    /* Caso 2: Simular que un proceso host activa FTZ (0x8000) o cambia el redondeo en MXCSR */
+    /* Caso 2: Simular que el hilo host activa FTZ (0x8000) y modo de redondeo hacia abajo (0x2000) */
     uint32_t saved_csr = _mm_getcsr();
-    _mm_setcsr(saved_csr | MXCSR_FTZ_BIT);
-    assert(!check_ieee754_mxcsr_state() && "check_ieee754_mxcsr_state() debe detectar FTZ=1!");
+    uint32_t host_custom_csr = saved_csr | MXCSR_FTZ_BIT | 0x2000U;
+    _mm_setcsr(host_custom_csr);
+    assert(!check_ieee754_mxcsr_state() && "check_ieee754_mxcsr_state() debe detectar FTZ=1 y redondeo alterado!");
 
     execute_plan5a_ivf_part_prune_avx2(ivf_idx, qv, pred, k, out5a, &cnt5a, m5a);
+    assert((_mm_getcsr() & MXCSR_CERTIFIED_MASK) == (host_custom_csr & MXCSR_CERTIFIED_MASK) &&
+           "Plan 5A debe restaurar el estado MXCSR original del hilo tras ejecutar el fallback!");
     execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, qv, pred, k, out5b, &cnt5b, m5b);
-    _mm_setcsr(saved_csr); /* Restaurar inmediatamente */
+    assert((_mm_getcsr() & MXCSR_CERTIFIED_MASK) == (host_custom_csr & MXCSR_CERTIFIED_MASK) &&
+           "Plan 5B debe restaurar el estado MXCSR original del hilo tras ejecutar el fallback!");
+    _mm_setcsr(saved_csr); /* Restaurar estado nominal para las siguientes pruebas */
     assert(check_ieee754_mxcsr_state() && "MXCSR restaurado correctamente!");
 
-    assert(m5a.fallback_triggered == 1U && "Plan 5A debe activar fallback a ExactScan cuando FTZ=1!");
-    assert(m5b.fallback_triggered == 1U && "Plan 5B debe activar fallback a ExactScan cuando FTZ=1!");
+    assert(m5a.fallback_triggered == 1U && m5b.fallback_triggered == 1U &&
+           m5a.query_rejected == 0U && m5b.query_rejected == 0U &&
+           m5a.status == QueryExecutionStatus::FALLBACK_MXCSR_RESTORED &&
+           m5b.status == QueryExecutionStatus::FALLBACK_MXCSR_RESTORED &&
+           "Plan 5A/5B deben activar FALLBACK_MXCSR_RESTORED cuando MXCSR es no estandar!");
     assert(m5a.dists_evaluated == pred.eligible_count && m5b.dists_evaluated == pred.eligible_count &&
            "En modo fallback deben evaluarse todos los vectores elegibles sin podar!");
+    assert(cnt5a == gt_cnt && cnt5b == gt_cnt);
     for (uint32_t r = 0; r < k; ++r) {
         assert(out5a[r].id == gt[r].id && out5b[r].id == gt[r].id &&
-               "El fallback por MXCSR debe preservar RankMatch@K = 100%!");
+               out5a[r].dist_sq == gt[r].dist_sq && out5b[r].dist_sq == gt[r].dist_sq &&
+               "El fallback con restauracion temporal de MXCSR debe preservar RankMatch@K = 100% y distancias exactas!");
     }
 
-    /* Caso 3: Simular consulta con coordenada fuera del dominio certificado (> 1.0e15f) */
-    alignas(64) float q_out_of_domain[64];
-    for (uint32_t d = 0; d < 64; ++d) q_out_of_domain[d] = qv[d];
-    q_out_of_domain[7] = 2.0e16f; /* Excede CERTIFIED_MAX_COORD_ABS (1.0e15f) */
-    assert(!check_vector_domain_certified(q_out_of_domain, 64) &&
-           "check_vector_domain_certified() debe rechazar |coord| > 1.0e15f!");
+    /* Caso 3: Consulta finita fuera del dominio certificado de poda (2.0e16f > 1e15f), pero segura en ExactScan (<= 1e18f) */
+    alignas(64) float q_out_safe[64];
+    for (uint32_t d = 0; d < 64; ++d) q_out_safe[d] = qv[d];
+    q_out_safe[7] = 2.0e16f;
+    assert(!check_vector_domain_certified(q_out_safe, 64) &&
+           "check_vector_domain_certified() debe rechazar |coord| = 2.0e16f > 1.0e15f!");
+    assert(check_query_canonical_fallback_safe(q_out_safe, 64) &&
+           "check_query_canonical_fallback_safe() debe aceptar |coord| = 2.0e16f <= 1.0e18f!");
 
-    execute_plan5a_ivf_part_prune_avx2(ivf_idx, q_out_of_domain, pred, k, out5a, &cnt5a, m5a);
-    execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, q_out_of_domain, pred, k, out5b, &cnt5b, m5b);
+    Neighbor gt_out[50];
+    uint32_t gt_out_cnt = 0;
+    execute_plan0_ref_hito9(aos_idx, q_out_safe, pred, k, gt_out, &gt_out_cnt, m_gt);
+    execute_plan5a_ivf_part_prune_avx2(ivf_idx, q_out_safe, pred, k, out5a, &cnt5a, m5a);
+    execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, q_out_safe, pred, k, out5b, &cnt5b, m5b);
     assert(m5a.fallback_triggered == 1U && m5b.fallback_triggered == 1U &&
-           "Coordenadas fuera del rango certificado deben activar fallback a ExactScan!");
+           m5a.query_rejected == 0U && m5b.query_rejected == 0U &&
+           m5a.status == QueryExecutionStatus::FALLBACK_QUERY_OUT_OF_CERT_DOMAIN &&
+           m5b.status == QueryExecutionStatus::FALLBACK_QUERY_OUT_OF_CERT_DOMAIN &&
+           "Coordenadas en (1e15, 1e18] deben activar FALLBACK_QUERY_OUT_OF_CERT_DOMAIN!");
+    assert(cnt5a == gt_out_cnt && cnt5b == gt_out_cnt);
+    for (uint32_t r = 0; r < k; ++r) {
+        assert(std::isfinite(out5a[r].dist_sq) && std::isfinite(out5b[r].dist_sq));
+        assert(out5a[r].id == gt_out[r].id && out5b[r].id == gt_out[r].id &&
+               out5a[r].dist_sq == gt_out[r].dist_sq && out5b[r].dist_sq == gt_out[r].dist_sq &&
+               "El fallback para consultas en (1e15, 1e18] debe producir el ranking exacto de Plan 0!");
+    }
 
-    /* Caso 4: Simular coordenada no finita (NaN / Inf) */
-    q_out_of_domain[7] = INFINITY;
-    assert(!check_vector_domain_certified(q_out_of_domain, 64) &&
-           "check_vector_domain_certified() debe rechazar INFINITY!");
+    /* Caso 4: Consultas no procesables con garantias (overflow 1.0e20f, INFINITY, NAN) -> rechazo explicito */
+    const float unsafe_vals[3] = {1.0e20f, INFINITY, NAN};
+    for (int u = 0; u < 3; ++u) {
+        alignas(64) float q_unsafe[64];
+        for (uint32_t d = 0; d < 64; ++d) q_unsafe[d] = qv[d];
+        q_unsafe[7] = unsafe_vals[u];
+        assert(!check_query_canonical_fallback_safe(q_unsafe, 64) &&
+               "check_query_canonical_fallback_safe() debe rechazar entradas que causen overflow o NaN/Inf!");
+
+        cnt5a = 999U; cnt5b = 999U;
+        execute_plan5a_ivf_part_prune_avx2(ivf_idx, q_unsafe, pred, k, out5a, &cnt5a, m5a);
+        execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, q_unsafe, pred, k, out5b, &cnt5b, m5b);
+        assert(cnt5a == 0U && cnt5b == 0U &&
+               m5a.fallback_triggered == 0U && m5b.fallback_triggered == 0U &&
+               m5a.query_rejected == 1U && m5b.query_rejected == 1U &&
+               m5a.status == QueryExecutionStatus::REJECTED_UNSAFE_QUERY_DOMAIN &&
+               m5b.status == QueryExecutionStatus::REJECTED_UNSAFE_QUERY_DOMAIN &&
+               "Consultas con riesgo de overflow o NaN/Inf deben ser rechazadas explicitamente!");
+    }
+
+    /* Caso 5: Corpus invalido en construccion (coordenada 1.0e20f o NAN en ds.vectors) -> rechazo del indice */
+    float orig_coord = ds.vectors[13];
+    const float bad_corpus_vals[2] = {1.0e20f, NAN};
+    for (int b = 0; b < 2; ++b) {
+        ds.vectors[13] = bad_corpus_vals[b];
+        IVFPartitionedIndex bad_idx;
+        bool bad_ok = build_ivf_partitioned_index(ds, 16, 8, bad_idx);
+        assert(!bad_ok && !bad_idx.certified_Contract_valid && bad_idx.num_vectors == 0U &&
+               "build_ivf_partitioned_index() debe rechazar construir el indice cuando el corpus es invalido!");
+
+        cnt5a = 999U; cnt5b = 999U;
+        execute_plan5a_ivf_part_prune_avx2(bad_idx, qv, pred, k, out5a, &cnt5a, m5a);
+        execute_plan5b_ivf_full_exact_prune_avx2(bad_idx, qv, pred, k, out5b, &cnt5b, m5b);
+        assert(cnt5a == 0U && cnt5b == 0U &&
+               m5a.fallback_triggered == 0U && m5b.fallback_triggered == 0U &&
+               m5a.query_rejected == 1U && m5b.query_rejected == 1U &&
+               m5a.status == QueryExecutionStatus::REJECTED_INVALID_CORPUS_INDEX &&
+               m5b.status == QueryExecutionStatus::REJECTED_INVALID_CORPUS_INDEX &&
+               "Consultas sobre un indice rechazado deben fallar con REJECTED_INVALID_CORPUS_INDEX!");
+    }
+    ds.vectors[13] = orig_coord;
     _mm_setcsr(saved_csr); /* Limpiar flags sticky de excepcion tras pruebas extremas */
 }
 
@@ -722,23 +895,26 @@ static void run_certification_suite(const char* suite_name,
 int main() {
     std::cout << "================================================================================\n";
     std::cout << "ALG-Flat 2.0 (Hito 2A.3): Contrato Formal de Entorno IEEE-754 y Kernel Unificado\n";
-    std::cout << "  - Validacion de MXCSR (Round-to-Nearest-Even, FTZ=0, DAZ=0) y dominio |x|<=1e15\n";
-    std::cout << "  - Aritmetica de intervalos en binary64 (redondeo hacia afuera) + Oraculo long double\n";
+    std::cout << "  - Separacion formal: MXCSR restaurado vs Fallback seguro (<=1e18) vs Rechazo (>1e18/Corpus)\n";
+    std::cout << "  - Aritmetica de intervalos en binary64 + Oraculo DoubleDouble 106-bit (Dekker + FMA)\n";
     std::cout << "  - Kernel unificado templado (AuditMode=false/true) sin duplicacion produccion/auditor\n";
     std::cout << "  - Nivel 1A/1B: IDSetRecall (sin duplicados) + RankMatch posicion a posicion\n";
     std::cout << "  - Nivel 3    : Exceso con signo Delta = LB_safe^2 - d_orig^2 <= 0.0 (0 tol)\n";
     std::cout << "================================================================================\n";
 
     verify_directed_rounding_and_interval_oracle();
-    printf("[OK] Oraculo en long double + Aritmetica de Intervalos binary64 verificados (40 regimenes x 12 ordenes de magnitud)\n");
+    printf("[OK] Oraculo DoubleDouble 106-bit (u_106 = 2^-106 = 2.465e-32; ABI LDBL_MANT_DIG=%d, DBL_MANT_DIG=%d) verificado\n",
+           LDBL_MANT_DIG, DBL_MANT_DIG);
 
     verify_runtime_environment_and_domain_contract();
-    printf("[OK] Contrato MXCSR (deteccion FTZ/DAZ) y dominio de coordenadas (|x| <= 1.0e15f) + Fallback a ExactScan verificados\n");
+    printf("[OK] Contrato 5 casos verificado: Nominal, MXCSR restaurado, Fallback (1e15..1e18], Rechazo Query (>1e18/Inf/NaN) y Rechazo Corpus\n");
 
     uint32_t raw_csr = 0;
     check_ieee754_mxcsr_state(&raw_csr);
-    printf("Estado MXCSR activo: 0x%04X (Round=0, FTZ=0, DAZ=0) | MaxCoordAbs=%.1e\n",
-           raw_csr, static_cast<double>(CERTIFIED_MAX_COORD_ABS));
+    printf("Estado MXCSR activo: 0x%04X (Round=0, FTZ=0, DAZ=0) | CertMax=%.1e | FallbackMax=%.1e\n",
+           raw_csr,
+           static_cast<double>(CERTIFIED_MAX_COORD_ABS),
+           static_cast<double>(CANONICAL_FALLBACK_MAX_COORD_ABS));
     printf("Constantes IEEE-754 derivadas (u_32 = 2^-24 = %.3e, u_64 = 2^-53 = %.3e):\n",
            IEEE754_F32_U, IEEE754_F64_U);
     printf("  gamma_17 = %.3e | gamma_33 = %.3e | gamma_64 = %.3e | gamma_66 = %.3e | gamma_67 = %.3e\n",

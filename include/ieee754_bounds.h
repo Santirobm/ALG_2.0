@@ -87,8 +87,18 @@ namespace alg_flat {
 static constexpr double IEEE754_F32_U = 5.9604644775390625e-8;  /* 2^-24 exacto */
 static constexpr double IEEE754_F64_U = 1.1102230246251565e-16; /* 2^-53 exacto */
 
-/* Dominio maximo por coordenada para garantizar ausencia total de overflow en D=64 */
+/* Dominio maximo por coordenada para certificar la poda geometrica (PCA 64D + cotas) sin overflow */
 static constexpr float CERTIFIED_MAX_COORD_ABS = 1.0e15f;
+
+/*
+ * Dominio maximo por coordenada de consulta para que el fallback canonico `ExactScan` (`l2_hito9_ref`)
+ * frente a un corpus certificado (|x_d| <= 1.0e15f) sea garantizadamente finito y libre de overflow en float32:
+ *   64 * (1.0e18 + 1.0e15)^2 * (1 + gamma_66) = 6.413e37 << FLT_MAX (3.4028235e38).
+ * Si alguna coordenada de consulta excede CANONICAL_FALLBACK_MAX_COORD_ABS o es NaN/Inf,
+ * incluso `ExactScan` puede desbordar a `Inf` o `NaN` y romper el orden total del heap, por lo que
+ * la consulta debe ser rechazada explicitamente.
+ */
+static constexpr float CANONICAL_FALLBACK_MAX_COORD_ABS = 1.0e18f;
 
 /* Holgura aditiva para cubrir cualquier posible underflow en cuadrados subnormales en 64D */
 static constexpr double SUBNORMAL_SQ_SLACK_F64 = 64.0 * 1.401298464324817e-45; /* 64 * FLT_TRUE_MIN */
@@ -110,28 +120,62 @@ inline bool check_ieee754_mxcsr_state(uint32_t* out_raw_mxcsr = nullptr) {
 }
 
 /*
- * Verifica que todas las coordenadas de un vector o buffer de `count` floats sean
- * finitas y cumplan |v[i]| <= CERTIFIED_MAX_COORD_ABS.
- * Incluye ruta rapida AVX2 para multiplos de 8 coordenadas (~4 ciclos para D=64).
+ * Guardia RAII que establece temporalmente un entorno MXCSR canonico (Round-to-Nearest-Even,
+ * FTZ=0, DAZ=0) durante la ejecucion del fallback `ExactScan` y restaura el estado original
+ * del hilo al salir del ambito.
  */
-inline bool check_vector_domain_certified(const float* v, size_t count) {
+struct CanonicalMxcsrScope {
+    uint32_t saved_csr;
+    bool modified;
+
+    inline CanonicalMxcsrScope() {
+        saved_csr = _mm_getcsr();
+        if ((saved_csr & MXCSR_CERTIFIED_MASK) != 0U) {
+            uint32_t clean_csr = (saved_csr & ~MXCSR_CERTIFIED_MASK);
+            _mm_setcsr(clean_csr);
+            modified = true;
+        } else {
+            modified = false;
+        }
+    }
+
+    inline ~CanonicalMxcsrScope() {
+        if (modified) {
+            _mm_setcsr(saved_csr);
+        }
+    }
+};
+
+/*
+ * Verifica con AVX2 que todas las coordenadas de un buffer de `count` floats sean
+ * finitas y cumplan |v[i]| <= max_abs.
+ */
+inline bool check_vector_domain_bounded(const float* v, size_t count, float max_abs) {
     if (!v) return false;
     size_t i = 0;
     const __m256 v_sign_mask = _mm256_set1_ps(-0.0f);
-    const __m256 v_max_abs   = _mm256_set1_ps(CERTIFIED_MAX_COORD_ABS);
+    const __m256 v_max_abs   = _mm256_set1_ps(max_abs);
     for (; i + 8 <= count; i += 8) {
         __m256 x = _mm256_loadu_ps(v + i);
         __m256 abs_x = _mm256_andnot_ps(v_sign_mask, x);
-        /* _CMP_LE_OQ devuelve false (0) si abs_x > CERTIFIED_MAX_COORD_ABS o si x es NaN/Inf */
+        /* _CMP_LE_OQ devuelve false (0) si abs_x > max_abs o si x es NaN/Inf */
         __m256 ok = _mm256_cmp_ps(abs_x, v_max_abs, _CMP_LE_OQ);
         if (_mm256_movemask_ps(ok) != 0xFF) return false;
     }
     for (; i < count; ++i) {
         float x = v[i];
         if (!std::isfinite(x)) return false;
-        if (std::fabs(x) > CERTIFIED_MAX_COORD_ABS) return false;
+        if (std::fabs(x) > max_abs) return false;
     }
     return true;
+}
+
+inline bool check_vector_domain_certified(const float* v, size_t count) {
+    return check_vector_domain_bounded(v, count, CERTIFIED_MAX_COORD_ABS);
+}
+
+inline bool check_query_canonical_fallback_safe(const float* q, size_t count) {
+    return check_vector_domain_bounded(q, count, CANONICAL_FALLBACK_MAX_COORD_ABS);
 }
 
 /*
@@ -247,13 +291,14 @@ inline double one_minus_gamma_down_f64(uint32_t n) {
 }
 
 /*
- * Redondeo dirigido hacia +infinito (cota superior estricta en float32):
- * Amplifica por (1 + 16 * u_64) para cubrir hasta 16 pasos de redondeo en double y
- * garantiza mediante next_ulp_up_pos_f32 que static_cast<double>(f) >= x_up > x.
+ * Conversion dirigida hacia +infinito de binary64 a binary32 (float32):
+ * Avanza 1 ULP en binary64 y garantiza mediante next_ulp_up_pos_f32 que
+ * static_cast<double>(f) >= x_up > x (sin constantes heuristicas adicionales,
+ * dado que cada operacion intermedia ya usa aritmetica de intervalos hacia afuera).
  */
 inline float round_up_f32(double x) {
     if (x <= 0.0) return 0.0f;
-    double x_up = next_ulp_up_pos_f64(x * (1.0 + 16.0 * IEEE754_F64_U));
+    double x_up = next_ulp_up_pos_f64(x);
     float f = static_cast<float>(x_up);
     if (static_cast<double>(f) < x_up) {
         f = next_ulp_up_pos_f32(f);
@@ -262,13 +307,13 @@ inline float round_up_f32(double x) {
 }
 
 /*
- * Redondeo dirigido hacia 0 (cota inferior estricta en float32 para magnitudes >= 0):
- * Reduce por (1 - 16 * u_64) para cubrir hasta 16 pasos de redondeo en double y
- * garantiza mediante next_ulp_down_pos_f32 que 0 <= static_cast<double>(f) <= x_down < x.
+ * Conversion dirigida hacia 0 de binary64 a binary32 (float32) para magnitudes >= 0:
+ * Retrocede 1 ULP en binary64 y garantiza mediante next_ulp_down_pos_f32 que
+ * 0 <= static_cast<double>(f) <= x_down < x.
  */
 inline float round_down_f32(double x) {
     if (x <= 0.0) return 0.0f;
-    double x_down = next_ulp_down_pos_f64(x * (1.0 - 16.0 * IEEE754_F64_U));
+    double x_down = next_ulp_down_pos_f64(x);
     float f = static_cast<float>(x_down);
     if (static_cast<double>(f) > x_down) {
         f = next_ulp_down_pos_f32(f);

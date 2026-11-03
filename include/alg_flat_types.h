@@ -119,6 +119,14 @@ struct QueryPredicate {
     uint32_t sel_index;
 };
 
+enum class QueryExecutionStatus : uint32_t {
+    OK_CERTIFIED                       = 0, /* Ejecucion nominal con poda geometrica certificada */
+    FALLBACK_MXCSR_RESTORED            = 1, /* MXCSR no estandar: poda desactivada, ExactScan ejecutado bajo MXCSR canonico temporal */
+    FALLBACK_QUERY_OUT_OF_CERT_DOMAIN  = 2, /* Consulta finita fuera de [-1e15, 1e15] pero dentro de [-1e18, 1e18]: ExactScan seguro */
+    REJECTED_UNSAFE_QUERY_DOMAIN       = 3, /* Consulta con NaN/Inf o |q_d| > 1e18 (riesgo de overflow en ExactScan): rechazada */
+    REJECTED_INVALID_CORPUS_INDEX      = 4  /* Indice no construido o rechazado por corpus invalido: consulta rechazada */
+};
+
 struct QueryExecutionMetrics {
     double prep_us;
     double calc_us;
@@ -129,7 +137,9 @@ struct QueryExecutionMetrics {
     uint32_t partitions_visited;
     uint32_t partitions_total;
     uint64_t bytes_read;
-    uint32_t fallback_triggered; /* 1 si MXCSR o el dominio de entrada violaron el contrato IEEE-754 y forzaron ExactScan */
+    uint32_t fallback_triggered; /* 1 si se desactivo la poda y se ejecuto ExactScan seguro */
+    uint32_t query_rejected;     /* 1 si la consulta o el indice violan las garantias minimas de ExactScan */
+    QueryExecutionStatus status; /* Codigo formal del contrato de ejecucion */
 };
 
 /*

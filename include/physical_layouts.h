@@ -143,7 +143,13 @@ struct IVFPartitionedIndex {
 void build_flat_aos_index(const BenchmarkDataset& ds, FlatAoSIndex& out_idx);
 void build_flat_soa_index(const BenchmarkDataset& ds, FlatSoAIndex& out_idx);
 void build_flat_aosoa_index(const BenchmarkDataset& ds, FlatAoSoAIndex& out_idx);
-void build_ivf_partitioned_index(const BenchmarkDataset& ds,
+/*
+ * Construye el indice particionado certificado IVF.
+ * Si el corpus contiene coordenadas no finitas o fuera de [-CERTIFIED_MAX_COORD_ABS, CERTIFIED_MAX_COORD_ABS],
+ * si dim != 64, o si el estado MXCSR de construccion es invalido, RECHAZA la construccion del indice
+ * (`out_idx.certified_Contract_valid = false`, `out_idx.num_vectors = 0`) y devuelve `false`.
+ */
+bool build_ivf_partitioned_index(const BenchmarkDataset& ds,
                                  uint32_t num_partitions,
                                  uint32_t kmeans_iters,
                                  IVFPartitionedIndex& out_idx);

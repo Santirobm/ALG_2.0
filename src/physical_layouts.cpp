@@ -259,7 +259,7 @@ void build_flat_aosoa_index(const BenchmarkDataset& ds, FlatAoSoAIndex& out_idx)
     out_idx.build_time_ms = elapsed_ms(t0, t1);
 }
 
-void build_ivf_partitioned_index(const BenchmarkDataset& ds,
+bool build_ivf_partitioned_index(const BenchmarkDataset& ds,
                                  uint32_t num_partitions,
                                  uint32_t kmeans_iters,
                                  IVFPartitionedIndex& out_idx) {
@@ -280,12 +280,45 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
     aligned_free_64(out_idx.part_aos_tail48_norm);
     aligned_free_64(out_idx.part_aos_tail32_norm);
 
+    out_idx.ortho_basis = nullptr;
+    out_idx.global_mean = nullptr;
+    out_idx.centroids = nullptr;
+    out_idx.rotated_centroids = nullptr;
+    out_idx.centroid_mean_norms = nullptr;
+    out_idx.part_orig_vectors = nullptr;
+    out_idx.part_aos_vectors = nullptr;
+    out_idx.part_aos_ids = nullptr;
+    out_idx.part_aos_categories = nullptr;
+    out_idx.part_aos_radii = nullptr;
+    out_idx.part_aos_tail48_norm = nullptr;
+    out_idx.part_aos_tail32_norm = nullptr;
+    out_idx.partitions.clear();
+    out_idx.eligible_ivf_ids_per_sel.clear();
+    out_idx.eligible_part_offsets_per_sel.clear();
+
+    /*
+     * Validacion estricta del contrato de corpus y entorno en tiempo de construccion:
+     * Si el corpus tiene coordenadas no finitas o fuera del dominio certificado (|x_d| > 1e15),
+     * si dim != 64 o si MXCSR es invalido, se RECHAZA la construccion del indice certificado.
+     * No se construye un indice invalido que prometa exactitud posterior via fallback.
+     */
+    const bool contract_ok = (nv > 0U)
+                          && (dim == 64U)
+                          && (num_partitions > 0U)
+                          && check_ieee754_mxcsr_state()
+                          && check_vector_domain_certified(ds.vectors, static_cast<size_t>(nv) * dim);
+    if (!contract_ok) {
+        out_idx.num_vectors = 0U;
+        out_idx.dim = 0U;
+        out_idx.num_partitions = 0U;
+        out_idx.certified_Contract_valid = false;
+        return false;
+    }
+
     out_idx.num_vectors = nv;
     out_idx.dim = dim;
     out_idx.num_partitions = num_partitions;
-    out_idx.certified_Contract_valid = check_ieee754_mxcsr_state()
-                                    && (dim == 64U)
-                                    && check_vector_domain_certified(ds.vectors, static_cast<size_t>(nv) * dim);
+    out_idx.certified_Contract_valid = true;
 
     out_idx.ortho_basis = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(dim) * dim * sizeof(float)));
     out_idx.global_mean = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(dim) * sizeof(float)));
@@ -396,7 +429,8 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
     /* 2. Asignacion exacta de los N vectores a las particiones y calculo de radios en doble precision */
     struct AssignedVec {
         uint32_t id;
-        double radius_exact;
+        double radius_down_f64;
+        double radius_up_f64;
         float radius_f32;
     };
     std::vector<std::vector<AssignedVec>> part_buckets(num_partitions);
@@ -415,15 +449,20 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
                 best_c = c;
             }
         }
-        /* Calcular el radio exacto en doble precision respecto del centroide asignado */
+        /* Calcular intervalo [r_down, r_up] en binary64 respecto del centroide asignado */
         const float* cent = out_idx.centroids + static_cast<size_t>(best_c) * dim;
-        double d2_exact = 0.0;
+        double d2_up = 0.0;
+        double d2_down = 0.0;
+        double d2_nom = 0.0;
         for (uint32_t d = 0; d < dim; ++d) {
-            double diff = static_cast<double>(v[d]) - static_cast<double>(cent[d]);
-            d2_exact += diff * diff;
+            double diff = std::fabs(static_cast<double>(v[d]) - static_cast<double>(cent[d]));
+            d2_nom += diff * diff;
+            d2_up = add_up_f64(d2_up, mul_up_f64(diff, diff));
+            double sq_down = mul_down_f64(diff, diff);
+            d2_down = (d == 0) ? sq_down : ((d2_down + sq_down > 0.0) ? next_ulp_down_pos_f64(d2_down + sq_down) : 0.0);
         }
-        double r_exact = std::sqrt(d2_exact);
-        part_buckets[best_c].push_back({i, r_exact, static_cast<float>(r_exact)});
+        double r_nom = std::sqrt(d2_nom);
+        part_buckets[best_c].push_back({i, sqrt_down_f64(d2_down), sqrt_up_f64(d2_up), static_cast<float>(r_nom)});
     }
 
     /* Ordenar cada particion por radio ascendente */
@@ -459,8 +498,14 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
 
         if (cnt > 0) {
             /* Redondeo conservador IEEE-754: min_radius hacia 0, max_radius hacia +inf */
-            gp.min_radius = round_down_f32(bucket.front().radius_exact);
-            gp.max_radius = round_up_f32(bucket.back().radius_exact);
+            double min_r_down = bucket.front().radius_down_f64;
+            double max_r_up   = bucket.back().radius_up_f64;
+            for (uint32_t k = 0; k < cnt; ++k) {
+                if (bucket[k].radius_down_f64 < min_r_down) min_r_down = bucket[k].radius_down_f64;
+                if (bucket[k].radius_up_f64 > max_r_up) max_r_up = bucket[k].radius_up_f64;
+            }
+            gp.min_radius = round_down_f32(min_r_down);
+            gp.max_radius = round_up_f32(max_r_up);
         } else {
             gp.min_radius = 0.0f;
             gp.max_radius = 0.0f;
@@ -532,6 +577,7 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
     auto t_end = std::chrono::high_resolution_clock::now();
     out_idx.layout_time_ms = elapsed_ms(t_kmeans, t_end);
     out_idx.total_build_time_ms = elapsed_ms(t_start, t_end);
+    return true;
 }
 
 } // namespace alg_flat

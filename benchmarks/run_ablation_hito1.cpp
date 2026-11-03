@@ -121,6 +121,8 @@ int main() {
         meta << "Process_Priority: HIGH_PRIORITY_CLASS\n";
         meta << "MXCSR_State_Hex: 0x" << std::hex << raw_csr << std::dec << " (RoundToNearestEven=0, FTZ=0, DAZ=0, Contract_Valid=" << (csr_ok ? "true" : "false") << ")\n";
         meta << "Certified_Domain_MaxCoordAbs: " << CERTIFIED_MAX_COORD_ABS << " (finite float32, no overflow in 64D L2/PCA)\n";
+        meta << "Canonical_Fallback_MaxCoordAbs: " << CANONICAL_FALLBACK_MAX_COORD_ABS << " (finite float32, no overflow in ExactScan l2_hito9_ref)\n";
+        meta << "Extended_Precision_Oracle: DoubleDouble 106-bit (Dekker + FMA, u_106=2^-106=2.465e-32; ABI LDBL_MANT_DIG=" << LDBL_MANT_DIG << ", DBL_MANT_DIG=" << DBL_MANT_DIG << ")\n";
         meta << "Corpus_Vectors: 100000\n";
         meta << "Dimension: 64 (float32, 25.6 MB raw corpus)\n";
         meta << "Seed: 8\n";

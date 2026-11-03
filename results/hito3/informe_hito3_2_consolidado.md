@@ -37,12 +37,13 @@ En la batería de Hito 3.1 (10.000 consultas), se reportó un `StrictRankMatch` 
 
 ---
 
-## 3. Arquitectura del FAISS C++ Shim ABI-Stable
+## 3. Arquitectura del FAISS C++ Shim y Alcance Metodológico
 
-Para certificar que la comparación con FAISS sea irrefutable y no dependa de enlaces de biblioteca frágiles:
+Para garantizar que el cronometraje de búsqueda mida exclusivamente el motor y no la sobrecarga de un entorno interpretado:
 - Se implementó un componente C Shim nativo: [`benchmarks/faiss_comparison/faiss_c_shim.h`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/benchmarks/faiss_comparison/faiss_c_shim.h) y [`benchmarks/faiss_comparison/faiss_c_shim.cpp`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/benchmarks/faiss_comparison/faiss_c_shim.cpp).
-- Las funciones `faiss_shim_create_flat_l2`, `faiss_shim_flat_add`, `faiss_shim_search_flat` y `faiss_id_selector_bitmap_create_shim` se enlazan estáticamente contra la exportación de `faiss.lib` y ejecutan llamadas C directas.
-- El arnés de prueba [`tests/test_faiss_shim_equivalence.cpp`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/tests/test_faiss_shim_equivalence.cpp) certificó una equivalencia bit a bit del 100% con latencia idéntica.
+- **Camino Crítico de Búsqueda:** La función `faiss_shim_search_flat` invoca directamente los símbolos binarios exportados (`?search@IndexFlat@faiss@@...`), operando sobre memoria nativa con punteros de buffer crudos y cero llamadas a Python o asignaciones dinámicas dentro del cronómetro.
+- **Fase de Inicialización:** La creación y configuración de los objetos (`faiss_shim_create_flat_l2`, `faiss_id_selector_bitmap_create_shim`) se realiza fuera del cronómetro mediante el cargador nativo de FAISS y extracción de punteros de envoltorio SWIG.
+- **Estado de la ABI:** La interfaz expuesta es `extern "C"` y la búsqueda opera libre de overhead de runtime. No obstante, al depender de la estructura interna del paquete binario de FAISS para la instanciación previa, se define para Hito 3.3 la transición a una instanciación C++ pura y desacoplada.
 - Ambos motores son cronometrados estrictamente con `QueryPerformanceCounter` y barreras `_mm_lfence()`, fijados al **P-Core 0** con prioridad de proceso alta y 1 hilo OpenMP forzado (`omp_set_num_threads(1)`).
 
 ---
@@ -74,8 +75,9 @@ Se evaluó la curva continua de rendimiento sobre una grilla de 16 selectividade
 | **100.00%** (sin filtro) | **1.07×** | **1.07×** | **1.05×** | **1.15×** | 1.3% |
 
 ### Conclusión Arquitectónica del Break-Even:
+- **Separación Metodológica de Selectividad 0.0%:** El caso con filtro vacío (0.0% de candidatos) representa una optimización de circuito corto en tiempo de ejecución (ALG detecta en 8,6 µs que no existen candidatos elegibles, mientras que FAISS realiza un recorrido de 170 µs). Se clasifica como optimización *end-to-end* de producción, aislándola del cálculo estricto de búsqueda vectorial.
+- **Break-Even en Selectividades Positivas ($>0\%$):** Restringiendo la comparación a búsquedas reales con candidatos ($0.05\%$ a $100\%$), **ALG Plan 5A supera a FAISS Flat en todos los puntos de la grilla**. El speedup se escalona desde **15,04×** (en 0.05%) hasta **1,05×–1,07×** (en escaneo completo del 100% de los 100.000 vectores sin filtro).
 - **Ausencia de Cruce Negativo:** A diferencia de índices jerárquicos o grafos que colapsan ante filtros abiertos (donde el post-filtrado penaliza fuertemente el throughput), ALG Plan 5A converge asintóticamente a su kernel de barrido lineal continuo de registros AVX2.
-- Incluso al 100% de selectividad (donde no hay filtrado y se evalúan los 100.000 vectores), ALG Plan 5A es **1.05×–1.07× más rápido que FAISS Flat**.
 - El beneficio es masivo en los rangos comerciales típicos de búsqueda híbrida y multitenant ($0.1\% - 10\%$), donde el speedup se mantiene entre **2.35× y 14.77×**.
 
 ---
@@ -94,9 +96,17 @@ Se evaluó el comportamiento algorítmico al incrementar el corpus en un orden d
 | **1.000.000** | **5.58×** | **7.01×** | **3.26×** | **2.56×** | **1.61×** |
 
 ### B. Rendimiento Absoluto a Escala $N=1\text{M}$ (1 Millón de Vectores)
-- **Latencia ALG COLD (1% sel, Top-10):** **476.9 µs** vs 2.661.6 µs de FAISS (**Speedup: 5.58×**).
-- **Latencia ALG WARM (1% sel, Top-10):** **177.3 µs** vs 1.243.6 µs de FAISS (**Speedup: 7.01×**).
-- **Throughput a $N=1\text{M}$:** ALG alcanza **1.011,9 QPS** en WARM frente a 194,3 QPS de FAISS (**5.2× mayor capacidad de procesamiento**).
+Valores canónicos extraídos directamente de `scale_n_summary.csv` ($N=1\text{M}$, Selectividad 1%, Top-10):
+- **Régimen COLD (Evicción LLC 36 MB):**
+  - Latencia media ALG: **476,90 µs** (p50 = 447,80 µs, p95 = 657,43 µs)
+  - Latencia media FAISS: **2.661,56 µs** (p50 = 2.594,45 µs, p95 = 3.042,42 µs)
+  - **Speedup COLD:** **5,58×**
+  - **Throughput COLD:** ALG = **2.096,90 QPS** vs FAISS = **375,72 QPS** (5,58×).
+- **Régimen WARM (En memoria caché):**
+  - Latencia media ALG: **358,85 µs** (p50 = 348,40 µs, p95 = 539,95 µs)
+  - Latencia media FAISS: **2.514,05 µs** (p50 = 2.468,20 µs, p95 = 2.991,36 µs)
+  - **Speedup WARM:** **7,01×**
+  - **Throughput WARM:** ALG = **2.786,66 QPS** vs FAISS = **397,76 QPS** (7,01×).
 
 ### C. Costo de Posesión: Memoria y Tiempo de Indexación
 
@@ -109,6 +119,7 @@ Se evaluó el comportamiento algorítmico al incrementar el corpus en un orden d
 
 > [!NOTE]
 > El sobrecosto de memoria de ALG Plan 5A es únicamente del **+4.65%**, correspondiente a los centroides y radios esféricos de las 128 particiones y los punteros de alineación. El tiempo de construcción a 1 millón de vectores (2.99 segundos) es apto para entornos con ingesta periódica o re-indexación en background.
+> *Observación metodológica:* La variación en los tiempos puntuales de construcción de FAISS (152.4 ms a 100K frente a 23.1 ms a 250K) requiere un protocolo de medición con repeticiones alternadas y aislamiento de fases (reserva de memoria, ingestión y warm-up), el cual se integrará en Hito 3.3.
 
 ---
 
@@ -135,10 +146,9 @@ La prueba evaluó 9.600 consultas en geometrías no gaussianas con $N=100\text{K
 
 ---
 
-## 7. Dictamen Final de Cierre del Hito 3.2
+## 7. Dictamen Final y Transición a Hito 3.3
 
-1. **Integridad Metodológica:** La eliminación de capas dinámicas y el uso de C Shim nativo garantiza que los speedups de 1.5× a 53× son puramente atribuibles a la eficiencia de la microarquitectura de ALG Plan 5A y su acceso contiguo a memoria.
-2. **Garantía Matemática:** Se confirma formalmente que Plan 5A opera con **cero falsos negativos** bajo cualquier régimen de distribución de datos y selectividad de metadatos.
-3. **Escalabilidad Validada:** Plan 5A escala eficientemente hasta 1.000.000 de vectores con una sobrecarga de memoria imperceptible (+4.65%) y un incremento progresivo de su ventaja competitiva frente a FAISS Flat.
-
-**El Hito 3.2 se declara completado y aprobado en su totalidad.**
+1. **Integridad del Rendimiento de Búsqueda:** La ejecución desacoplada dentro del camino crítico garantiza que los speedups observados (1.5× a 53×) son atribuibles a la microarquitectura de ALG Plan 5A y su acceso contiguo alineado a registros AVX2.
+2. **Garantía Matemática:** Se confirma formalmente que Plan 5A opera con **cero falsos negativos** (`IDSetRecall = 100.00%`) bajo las 6 distribuciones no vistas y todas las selectividades evaluadas.
+3. **Escalabilidad Validada:** Plan 5A escala favorablemente hasta 1.000.000 de vectores incrementando su speedup COLD de 3.50× a 5.58× con un sobrecosto de memoria contenido (+4.65%).
+4. **Transición a Hito 3.3 (Real-World Validation & Dimensional Scaling):** Hito 3.2 cumple su objetivo de caracterización en laboratorio. Se aprueba la apertura de Hito 3.3 para validar el comportamiento en datasets de embeddings reales de producción, dimensionalidades extendidas ($D \in \{32, 64, 128, 256\}$), filtros multicolumna y concurrencia multihilo.

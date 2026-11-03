@@ -16,12 +16,13 @@
 
 ## 2. Inspección Hexadecimal Bit a Bit (Palabras IEEE 754)
 
-Se evaluó la acumulación de distancias cuadradas sobre los mismos vectores en tres rutas de ejecución:
+Se evaluó la acumulación de distancias cuadradas sobre los mismos vectores ejecutando directamente los kernels de producción de ALG y el oráculo:
 
 | Modo de Cómputo | Candidato A (ID: 50563) | Candidato B (ID: 80871) | Diferencia Hexadecimal | Diferencia Numérica |
 | :--- | :---: | :---: | :---: | :---: |
 | **Double binary64 (Oráculo)** | `1.0741608335483388`<br>`0x3ff12fc3452bbf58` | `1.0741607358890903`<br>`0x3ff12fc32af4a7ad` | Distintas en bits de mantisa 25..52 | $\Delta d^2 = 9.7659 \times 10^{-8}$ |
-| **Float32 AVX2 FMA (ALG Plan 5A)** | `1.07416081`<br>**`0x3f897e1a`** | `1.07416081`<br>**`0x3f897e1a`** | **COINCIDENCIA EXACTA BIT A BIT** | **0 ULP (Empate estricto)** |
+| **Kernel Producción 4x (`l2_sq_avx2_4x_aos`)** | `1.07416081`<br>**`0x3f897e1a`** | `1.07416081`<br>**`0x3f897e1a`** | **COINCIDENCIA EXACTA BIT A BIT** | **0 ULP (Empate estricto)** |
+| **Kernel Producción 1x (`l2_sq_avx2_1x_aos`)** | `1.07416081`<br>**`0x3f897e1a`** | `1.07416081`<br>**`0x3f897e1a`** | **COINCIDENCIA EXACTA BIT A BIT** | **0 ULP (Empate estricto)** |
 | **Float32 Escalar (sin FMA)** | `1.07416081`<br>`0x3f897e1a` | `1.07416070`<br>`0x3f897e19` | Diferencia en bit menos significativo | 1 ULP ($\approx 1.192 \times 10^{-7}$) |
 
 ---

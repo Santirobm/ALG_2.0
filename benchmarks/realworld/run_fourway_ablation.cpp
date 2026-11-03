@@ -86,10 +86,10 @@ struct DoubleTopKHeap {
             if (size == k) threshold_sq = data[0].dist_sq;
             return;
         }
-        if (dist_sq >= threshold_sq) return;
+        DoubleNeighbor cand{id, dist_sq};
+        if (!less(cand, data[0])) return;
 
         uint32_t i = 0;
-        DoubleNeighbor cand{id, dist_sq};
         while (true) {
             uint32_t left = (i << 1) + 1;
             uint32_t right = left + 1;

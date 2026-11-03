@@ -25,8 +25,12 @@ Los resultados del arnés de ablación simétrica de 4 vías proporcionan una re
 3. **Plan 5A introduce sobrecosto frente a un escaneo lineal contiguo:**  
    Al comparar Plan 5A contra un escaneo lineal idéntico sobre los mismos candidatos (**Variante A**), Plan 5A resulta entre **$1.2\times$ y $3.5\times$ más lento** (`Speedup B vs A = 0.28x a 0.84x`). El coste de calcular 128 distancias a centroides, ordenar las particiones y gestionar el despacho supera con creces el coste de calcular directamente los 900 vectores en un array plano.
 
-4. **El kernel AVX2 de ALG sí tiene una ventaja real frente al kernel de FAISS:**  
-   Al comparar la Variante A (ExactScan AVX2 de ALG) frente a la Variante C1 (FAISS Flat sobre candidatos compactos), **el kernel AVX2 de ALG supera a FAISS de forma consistente entre un $1.34\times$ y un $1.79\times$**. La ventaja arquitectónica de ALG reside en su kernel SIMD desenrollado 4x y su estructura de Top-K heap acotada, no en la poda esférica a nivel de partición para datasets de $N \le 100.000$.
+4. **A y C1 difieren en layout de memoria y no aíslan puramente el kernel:**  
+   Al examinar la implementación de la Variante A (`run_variant_a_exact_scan`), se constata que recupera los vectores no contiguamente desde el corpus original mediante punteros basados en IDs:
+   `const float* v0 = corpus_vectors + id0 * dim;`
+   En contraste, C1 evalúa sobre un sub-índice FAISS físicamente compactado y contiguo en memoria.
+   Por tanto, la relación $A / C_1$ no aísla únicamente el kernel SIMD, sino que incorpora el coste de recolección de memoria (gather) frente a un buffer contiguo. Esto explica por qué en condiciones con baja dispersión o acceso disperso (como `Semantic_Correlated` 1%), $A / C_1$ cae a **0.77x** (FAISS gana por localidad física), mientras que en `Uniform_Synthetic` 10% $A / C_1$ alcanza **1.79x**.  
+   Para aislar rigurosamente el kernel, se requiere incorporar una variante **A2** que evalúe el kernel de ALG sobre exactamente el mismo buffer físicamente contiguo que C1.
 
 ---
 
@@ -111,9 +115,11 @@ Analicemos el caso paradigmático de **Selectividad 1%, WARM, Top-10**:
    $$S_{\text{compact}} = \frac{140.21\text{ µs}}{7.04\text{ µs}} = \mathbf{19.92\times}$$  
    FAISS aceleró $20\times$ simplemente al buscar sobre un array contiguo de 900 elementos en lugar de escanear 90.000 con un bitmap.
 
-2. **Ventaja Kernel SIMD ($A \text{ vs } C_1$):**  
-   $$S_{\text{kernel}} = \frac{7.04\text{ µs}}{4.16\text{ µs}} = \mathbf{1.69\times}$$  
-   El kernel AVX2 4x unrolled con heap acotado de ALG supera al kernel AVX2 de FAISS por un $69\%$.
+2. **Comparación SIMD y Layout de Memoria ($A \text{ vs } C_1$):**  
+   $$S_{A / C_1} = \frac{T_{C_1}}{T_A}$$  
+   En `Uniform_Synthetic` (Sel 1%, WARM, Top-10), $S_{A / C_1} = 7.04 / 4.16 = \mathbf{1.69\times}$.  
+   Sin embargo, en `Semantic_Correlated` (Sel 1%, WARM, Top-10), $T_A = 14.71\text{ µs}$ y $T_{C_1} = 11.26\text{ µs}$, arrojando $S_{A / C_1} = \mathbf{0.77\times}$.  
+   Esta variación entre $0.77\times$ y $1.79\times$ demuestra que la Variante A no aísla exclusivamente la velocidad del kernel: A paga el coste de recuperar vectores dispersos en el espacio del corpus ($N=90.000$), mientras C1 disfruta de prefetching secuencial en su buffer contiguo. Solo una variante A2 sobre el mismo buffer compacto permite aislar el kernel sin sesgo de memoria.
 
 3. **Efecto de Poda y Partición ($B \text{ vs } A$):**  
    $$S_{\text{pruning}} = \frac{4.16\text{ µs}}{14.84\text{ µs}} = \mathbf{0.28\times} \quad (\text{Penalización de } 3.57\times)$$  
@@ -152,7 +158,7 @@ La explicación física de por qué `Pruning_Ratio_Pct == 0.00%` es directa:
 2. **Corrección de la Narrativa Comercial / Técnica:**  
    - **Queda formalmente refutado:** Que el speedup de $9.28\times$ en SimpleWiki 64D fuera evidencia de aceleración algorítmica por poda geométrica de esferas.
    - **Queda formalmente demostrado:** Que FAISS es altamente ineficiente cuando se le obliga a evaluar un `IDSelectorBitmap` sobre el corpus completo, y que un escaneo AVX2 nativo sobre una lista compacta pre-filtrada (Variante A) es la solución óptima para $N \le 100.000$ y selectividades $\le 10\%$.
-   - **Ventaja real de ALG:** El diseño de almacenamiento contiguo, el kernel AVX2 unrolled 4x y el bounded heap de ALG son intrínsecamente más rápidos que FAISS Flat ($1.34\times - 1.79\times$), independientemente de cualquier poda.
+   - **Estado de la comparación de kernels:** El kernel AVX2 de ALG presenta resultados altamente competitivos frente a FAISS sobre listas de candidatos, con picos de ventaja de hasta $1.79\times$, pero también caídas hasta $0.77\times$ cuando la recolección no contigua de memoria en A penaliza el recorrido. No se puede atribuir íntegramente la diferencia al kernel SIMD hasta comparar A2 (kernel de ALG sobre buffer físicamente contiguo) frente a C1 (FAISS sobre el mismo buffer). Esta resolución es el objetivo directo del **Hito 3.3.2**.
 
 ---
 

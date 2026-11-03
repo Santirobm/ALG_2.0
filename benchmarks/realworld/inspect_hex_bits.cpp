@@ -1,4 +1,5 @@
 // inspect_hex_bits.cpp
+#include "../../include/simd_kernels.h"
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -6,6 +7,8 @@
 #include <cmath>
 #include <cstring>
 #include <immintrin.h>
+
+using namespace alg_flat;
 
 int main() {
     const std::string corpus_file = "data/hito3_3/D64/corpus.f32";
@@ -49,42 +52,31 @@ int main() {
         d_B_float_scalar += diff_b * diff_b;
     }
 
-    // 3. AVX2 vector accumulation (matching execution_plans.cpp)
-    __m256 sum_A = _mm256_setzero_ps();
-    __m256 sum_B = _mm256_setzero_ps();
-    for (uint32_t d = 0; d < dim; d += 8) {
-        __m256 q_vec = _mm256_loadu_ps(q + d);
-        __m256 va_vec = _mm256_loadu_ps(v_A + d);
-        __m256 vb_vec = _mm256_loadu_ps(v_B + d);
-        __m256 diff_a = _mm256_sub_ps(q_vec, va_vec);
-        __m256 diff_b = _mm256_sub_ps(q_vec, vb_vec);
-        sum_A = _mm256_fmadd_ps(diff_a, diff_a, sum_A);
-        sum_B = _mm256_fmadd_ps(diff_b, diff_b, sum_B);
-    }
-    // Horizontal add
-    __m128 lo_A = _mm256_castps256_ps128(sum_A);
-    __m128 hi_A = _mm256_extractf128_ps(sum_A, 1);
-    __m128 s_A = _mm_add_ps(lo_A, hi_A);
-    s_A = _mm_hadd_ps(s_A, s_A);
-    s_A = _mm_hadd_ps(s_A, s_A);
-    float d_A_avx2 = _mm_cvtss_f32(s_A);
+    // 3. Exact production kernel: l2_sq_avx2_4x_aos
+    // We pass v_A as slot 0 and v_B as slot 1 (and dummy in slots 2,3)
+    __m128 d4 = l2_sq_avx2_4x_aos(q, v_A, v_B, v_A, v_B, dim);
+    alignas(16) float res4[4];
+    _mm_store_ps(res4, d4);
+    float d_A_prod_kernel = res4[0];
+    float d_B_prod_kernel = res4[1];
 
-    __m128 lo_B = _mm256_castps256_ps128(sum_B);
-    __m128 hi_B = _mm256_extractf128_ps(sum_B, 1);
-    __m128 s_B = _mm_add_ps(lo_B, hi_B);
-    s_B = _mm_hadd_ps(s_B, s_B);
-    s_B = _mm_hadd_ps(s_B, s_B);
-    float d_B_avx2 = _mm_cvtss_f32(s_B);
+    // 4. Exact 1x AoS production kernel: l2_sq_avx2_1x_aos
+    float d_A_1x_kernel = l2_sq_avx2_1x_aos(q, v_A, dim);
+    float d_B_1x_kernel = l2_sq_avx2_1x_aos(q, v_B, dim);
 
     uint64_t hex_A_dbl, hex_B_dbl;
     uint32_t hex_A_flt_sc, hex_B_flt_sc;
-    uint32_t hex_A_avx2, hex_B_avx2;
+    uint32_t hex_A_prod, hex_B_prod;
+    uint32_t hex_A_1x, hex_B_1x;
+
     memcpy(&hex_A_dbl, &d_A_double, 8);
     memcpy(&hex_B_dbl, &d_B_double, 8);
     memcpy(&hex_A_flt_sc, &d_A_float_scalar, 4);
     memcpy(&hex_B_flt_sc, &d_B_float_scalar, 4);
-    memcpy(&hex_A_avx2, &d_A_avx2, 4);
-    memcpy(&hex_B_avx2, &d_B_avx2, 4);
+    memcpy(&hex_A_prod, &d_A_prod_kernel, 4);
+    memcpy(&hex_B_prod, &d_B_prod_kernel, 4);
+    memcpy(&hex_A_1x, &d_A_1x_kernel, 4);
+    memcpy(&hex_B_1x, &d_B_1x_kernel, 4);
 
     std::cout << "================================================================================" << std::endl;
     std::cout << "HEXADECIMAL BIT ANALYSIS: QUERY 165 (CANDIDATES 50563 vs 80871)" << std::endl;
@@ -96,16 +88,23 @@ int main() {
               << " | Hex: 0x" << std::hex << std::setw(16) << std::setfill('0') << hex_B_dbl << std::dec << std::endl;
     std::cout << "  Delta double: " << std::abs(d_A_double - d_B_double) << std::endl;
 
-    std::cout << "\nFLOAT32 AVX2 (FMA + HADD):" << std::endl;
-    std::cout << "  Candidate A (50563): " << std::setprecision(9) << d_A_avx2 
-              << " | Hex: 0x" << std::hex << std::setw(8) << std::setfill('0') << hex_A_avx2 << std::dec << std::endl;
-    std::cout << "  Candidate B (80871): " << std::setprecision(9) << d_B_avx2 
-              << " | Hex: 0x" << std::hex << std::setw(8) << std::setfill('0') << hex_B_avx2 << std::dec << std::endl;
-    std::cout << "  AVX2 Float Hex difference: " << (hex_A_avx2 == hex_B_avx2 ? "EXACT BIT MATCH (0 ULP)" : "DIFFERENT BITS") << std::endl;
-    if (hex_A_avx2 != hex_B_avx2) {
-        int32_t ulp_diff = static_cast<int32_t>(hex_A_avx2) - static_cast<int32_t>(hex_B_avx2);
+    std::cout << "\nEXACT PRODUCTION KERNEL (l2_sq_avx2_4x_aos):" << std::endl;
+    std::cout << "  Candidate A (50563): " << std::setprecision(9) << d_A_prod_kernel 
+              << " | Hex: 0x" << std::hex << std::setw(8) << std::setfill('0') << hex_A_prod << std::dec << std::endl;
+    std::cout << "  Candidate B (80871): " << std::setprecision(9) << d_B_prod_kernel 
+              << " | Hex: 0x" << std::hex << std::setw(8) << std::setfill('0') << hex_B_prod << std::dec << std::endl;
+    std::cout << "  AVX2 4x Hex difference: " << (hex_A_prod == hex_B_prod ? "EXACT BIT MATCH (0 ULP)" : "DIFFERENT BITS") << std::endl;
+    if (hex_A_prod != hex_B_prod) {
+        int32_t ulp_diff = static_cast<int32_t>(hex_A_prod) - static_cast<int32_t>(hex_B_prod);
         std::cout << "  ULP difference: " << ulp_diff << " ULP" << std::endl;
     }
+
+    std::cout << "\nEXACT 1X KERNEL (l2_sq_avx2_1x_aos):" << std::endl;
+    std::cout << "  Candidate A (50563): " << std::setprecision(9) << d_A_1x_kernel 
+              << " | Hex: 0x" << std::hex << std::setw(8) << std::setfill('0') << hex_A_1x << std::dec << std::endl;
+    std::cout << "  Candidate B (80871): " << std::setprecision(9) << d_B_1x_kernel 
+              << " | Hex: 0x" << std::hex << std::setw(8) << std::setfill('0') << hex_B_1x << std::dec << std::endl;
+    std::cout << "  AVX2 1x Hex difference: " << (hex_A_1x == hex_B_1x ? "EXACT BIT MATCH (0 ULP)" : "DIFFERENT BITS") << std::endl;
 
     std::cout << "\nFLOAT32 SCALAR:" << std::endl;
     std::cout << "  Candidate A (50563): " << std::setprecision(9) << d_A_float_scalar 
@@ -113,10 +112,6 @@ int main() {
     std::cout << "  Candidate B (80871): " << std::setprecision(9) << d_B_float_scalar 
               << " | Hex: 0x" << std::hex << std::setw(8) << std::setfill('0') << hex_B_flt_sc << std::dec << std::endl;
     std::cout << "  Scalar Float Hex difference: " << (hex_A_flt_sc == hex_B_flt_sc ? "EXACT BIT MATCH (0 ULP)" : "DIFFERENT BITS") << std::endl;
-    if (hex_A_flt_sc != hex_B_flt_sc) {
-        int32_t ulp_diff = static_cast<int32_t>(hex_A_flt_sc) - static_cast<int32_t>(hex_B_flt_sc);
-        std::cout << "  ULP difference: " << ulp_diff << " ULP" << std::endl;
-    }
 
     return 0;
 }

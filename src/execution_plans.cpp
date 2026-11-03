@@ -1428,6 +1428,7 @@ static __attribute__((noinline)) void run_plan6_phase2_5b_noinline(
     uint32_t& quarter_evals,
     uint32_t& parts_visited,
     uint64_t& total_bytes,
+    QueryExecutionMetrics& metrics,
     Observer& obs) {
     const uint32_t dim = idx.dim;
     const uint32_t n_parts = idx.num_partitions;
@@ -1569,7 +1570,10 @@ static __attribute__((noinline)) void run_plan6_phase2_5b_noinline(
             pilot_quarters += (quarter_evals - quarters_before_part);
             if (pilot_parts >= 2U && pilot_vecs >= 120U) {
                 pilot_checked = true;
+                metrics.plan6_gate3_pilot_work = static_cast<float>(pilot_quarters) / static_cast<float>(pilot_vecs > 0 ? pilot_vecs : 1);
+                metrics.plan6_gate3_max_q_ratio = static_cast<float>(max_q_ratio);
                 if (static_cast<double>(pilot_quarters) > max_q_ratio * static_cast<double>(pilot_vecs)) {
+                    metrics.plan6_gate3_aborted = 1;
                     ++pi;
                     break;
                 }
@@ -1667,6 +1671,8 @@ static void run_plan6_adaptive_unified_core(const IVFPartitionedIndex& idx,
         }
 
         /* Compuerta 1 (Suficiencia de Volumen Sobreviviente tras 5A): p_surv_5a > 32 y n_surv_5a > 4000 */
+        metrics.plan6_gate1_p_surv = static_cast<float>(p_surv_5a);
+        metrics.plan6_gate1_n_surv = static_cast<float>(n_surv_5a);
         if (p_surv_5a > 32U && n_surv_5a > 4000U) {
             float d_med = p_order[n_parts >> 1].dc;
             float d_med_sq = d_med * d_med + 1.0e-12f;
@@ -1674,6 +1680,8 @@ static void run_plan6_adaptive_unified_core(const IVFPartitionedIndex& idx,
             float gamma_0 = d0_sq / d_med_sq;
             float eta_pot = heap.threshold_sq / d_med_sq;
             float m_bar = static_cast<float>(n_surv_5a) / static_cast<float>(p_surv_5a);
+            metrics.plan6_gate2_gamma0 = gamma_0;
+            metrics.plan6_gate2_eta_pot = eta_pot;
 
             /*
              * Compuerta 2:
@@ -1685,6 +1693,7 @@ static void run_plan6_adaptive_unified_core(const IVFPartitionedIndex& idx,
             float eta_limit = (m_bar < 95.0f) ? 0.38f : 0.56f;
             if (gamma_0 <= 0.45f && eta_pot <= eta_limit) {
                 use_5b_cascade = true;
+                metrics.plan6_selected_cascade = 1;
                 max_q_ratio = (m_bar >= 150.0f) ? 2.15 : 1.95;
             }
         }
@@ -1697,7 +1706,7 @@ static void run_plan6_adaptive_unified_core(const IVFPartitionedIndex& idx,
     if (use_5b_cascade) {
         run_plan6_phase2_5b_noinline<AuditMode>(
             idx, q, p_order, el_ivf_ids, part_offs, max_q_ratio,
-            pi, heap, quarter_evals, parts_visited, total_bytes, obs
+            pi, heap, quarter_evals, parts_visited, total_bytes, metrics, obs
         );
     }
 

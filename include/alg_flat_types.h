@@ -140,6 +140,16 @@ struct QueryExecutionMetrics {
     uint32_t fallback_triggered; /* 1 si se desactivo la poda y se ejecuto ExactScan seguro */
     uint32_t query_rejected;     /* 1 si la consulta o el indice violan las garantias minimas de ExactScan */
     QueryExecutionStatus status; /* Codigo formal del contrato de ejecucion */
+    /* Telemetria interna de decision adaptativa (Plan 6) */
+    uint8_t plan6_selected_cascade; /* 1 si la compuerta 2 activo la cascada 5B, 0 si se quedo en 5A */
+    uint8_t plan6_gate3_aborted;    /* 1 si el piloto de la compuerta 3 aborto 5B de regreso a 5A */
+    uint8_t reserved_flags[2];
+    float plan6_gate1_p_surv;
+    float plan6_gate1_n_surv;
+    float plan6_gate2_gamma0;
+    float plan6_gate2_eta_pot;
+    float plan6_gate3_pilot_work;   /* pilot_quarters / pilot_vecs */
+    float plan6_gate3_max_q_ratio;
 };
 
 /*

@@ -1317,4 +1317,562 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
     run_plan5b_unified_core<true>(idx, q, pred, k, heap, dummy_metrics, nullptr, audit_obs);
 }
 
+/*
+ * ============================================================================
+ * HITO 2B: SELECTOR ADAPTATIVO LIGERO GUIADO POR MODELO DE COSTO (PLAN 6)
+ * ============================================================================
+ * Restricciones metodologicas de Hito 2B:
+ *   1. Mantiene congelados los kernels certificados 5A y 5B y el contrato IEEE-754.
+ *   2. Usa Plan 5A como baseline de ejecucion (Prep identico a 5A, sin rotar q por defecto).
+ *   3. Estructura la ejecucion en 3 Fases Secuenciales sin sobrecarga de registros en 5A:
+ *      - Fase 1 (Sembrado Local en 5A): Evalua las primeras 3 particiones no vacias
+ *        (el cluster local de la consulta) con el kernel 4x AVX2 de 5A hasta poblar
+ *        `heap.size == k && seed_nonempty_parts >= 3`, convergiendo `heap.threshold_sq`
+ *        en ~2.5 us y evitando la doble evaluacion (PCA 64D + orig 64D = 512B/vec) que
+ *        sufre 5B en las particiones mas cercanas donde casi ningun vector es podable.
+ *      - Modelo de Costo de 3 Compuertas Deterministas:
+ *        * Compuerta 1 (Suficiencia de Poda de Particion 5A): Si `p_surv_5a <= 32` o
+ *          `n_surv_5a <= 4500` (ej. `R_k64_s003_Tight`), 5A ya poda >75% del corpus en
+ *          O(1) y termina en Fase 3 con 5A puro sin rotar `q`.
+ *        * Compuerta 2 (Concentracion Geometrica gamma_0, Compacidad eta_pot y Densidad m_bar):
+ *          Calcula `gamma_0 = d_c(0)^2 / d_med^2`, `eta_pot = theta_K^2 / d_med^2` y la
+ *          ocupacion media por particion sobreviviente `m_bar = n_surv_5a / p_surv_5a`.
+ *          Las consultas difusas o uniformes en la esfera (`gamma_0 > 0.46`) y las bolas
+ *          Top-K demasiado anchas para amortizar el setup por particion de 5B se descartan
+ *          de inmediato sin rotar `q`, pasando directo a Fase 3 (5A puro).
+ *        * Compuerta 3 (Piloto Empirico en Particiones No-Locales `pi >= 3`):
+ *          Si se superan las Compuertas 1 y 2, rota `q` de forma perezosa y ejecuta la
+ *          cascada 5B en Fase 2 monitoreando el trabajo efectivo en cuartos de vector
+ *          por candidato (`pilot_quarters / pilot_vecs`) tras >= 2 particiones no-locales.
+ *          Si supera el umbral de amortizacion frente a 5A, aborta 5B y completa en Fase 3.
+ */
+template <bool AuditMode, typename Observer>
+static inline void eval_partition_5a_step(const IVFPartitionedIndex& idx,
+                                          const float* q,
+                                          const uint32_t* el_ivf_ids,
+                                          uint32_t e_start,
+                                          uint32_t e_end,
+                                          float lb_part_sq,
+                                          uint32_t k,
+                                          TopKHeap& heap,
+                                          uint32_t& quarter_evals,
+                                          uint32_t& parts_visited,
+                                          uint64_t& total_bytes,
+                                          Observer& obs) {
+    if (heap.size == k) {
+        if (lb_part_sq > heap.threshold_sq) {
+            if constexpr (AuditMode) {
+                for (uint32_t e = e_start; e < e_end; ++e) {
+                    obs.on_checked(1);
+                    obs.on_pruned(PruneStage::PART, el_ivf_ids[e], static_cast<double>(lb_part_sq));
+                }
+            }
+            return;
+        }
+    }
+
+    parts_visited++;
+    const uint32_t dim = idx.dim;
+    const float* base_orig = idx.part_orig_vectors;
+    const uint32_t cand_cnt = e_end - e_start;
+    quarter_evals += cand_cnt * 4U;
+    total_bytes += static_cast<uint64_t>(cand_cnt) * (dim * sizeof(float) + sizeof(uint32_t));
+    if constexpr (AuditMode) {
+        obs.on_checked(cand_cnt);
+        obs.on_evaluated_orig(cand_cnt);
+    }
+
+    uint32_t e = e_start;
+    for (; e + 4 <= e_end; e += 4) {
+        uint32_t iv0 = el_ivf_ids[e];
+        uint32_t iv1 = el_ivf_ids[e + 1];
+        uint32_t iv2 = el_ivf_ids[e + 2];
+        uint32_t iv3 = el_ivf_ids[e + 3];
+
+        const float* v0 = base_orig + static_cast<size_t>(iv0) * dim;
+        const float* v1 = base_orig + static_cast<size_t>(iv1) * dim;
+        const float* v2 = base_orig + static_cast<size_t>(iv2) * dim;
+        const float* v3 = base_orig + static_cast<size_t>(iv3) * dim;
+
+        __m128 d4 = l2_sq_avx2_4x_aos(q, v0, v1, v2, v3, dim);
+        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
+        int mask = _mm_movemask_ps(_mm_cmple_ps(d4, _mm_set1_ps(gate)));
+        if (mask != 0) {
+            if (mask & 1) heap.push(idx.part_aos_ids[iv0], l2_hito9_ref(q, v0, dim));
+            if (mask & 2) heap.push(idx.part_aos_ids[iv1], l2_hito9_ref(q, v1, dim));
+            if (mask & 4) heap.push(idx.part_aos_ids[iv2], l2_hito9_ref(q, v2, dim));
+            if (mask & 8) heap.push(idx.part_aos_ids[iv3], l2_hito9_ref(q, v3, dim));
+        }
+    }
+    for (; e < e_end; ++e) {
+        uint32_t iv = el_ivf_ids[e];
+        const float* vp = base_orig + static_cast<size_t>(iv) * dim;
+        float d = l2_sq_avx2_1x_aos(q, vp, dim);
+        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
+        if (d <= gate) {
+            heap.push(idx.part_aos_ids[iv], l2_hito9_ref(q, vp, dim));
+        }
+    }
+}
+
+template <bool AuditMode, typename Observer>
+static __attribute__((noinline)) void run_plan6_phase2_5b_noinline(
+    const IVFPartitionedIndex& idx,
+    const float* q,
+    const PartitionOrder* p_order,
+    const uint32_t* el_ivf_ids,
+    const uint32_t* part_offs,
+    double max_q_ratio,
+    uint32_t& pi,
+    TopKHeap& heap,
+    uint32_t& quarter_evals,
+    uint32_t& parts_visited,
+    uint64_t& total_bytes,
+    Observer& obs) {
+    const uint32_t dim = idx.dim;
+    const uint32_t n_parts = idx.num_partitions;
+
+    alignas(64) float q_rot[64];
+    float q_mean_norm = 0.0f;
+    rotate_centered_query_avx2(idx.ortho_basis, q, idx.global_mean, q_rot, q_mean_norm, dim);
+
+    uint32_t pilot_parts = 0;
+    uint32_t pilot_vecs = 0;
+    uint32_t pilot_quarters = 0;
+    bool pilot_checked = false;
+
+    for (; pi < n_parts; ++pi) {
+        uint32_t pid = p_order[pi].part_id;
+        uint32_t e_start = part_offs[pid];
+        uint32_t e_end = part_offs[pid + 1];
+        if (e_start >= e_end) continue;
+
+        if (p_order[pi].lb_part_sq > heap.threshold_sq) {
+            if constexpr (AuditMode) {
+                for (uint32_t e = e_start; e < e_end; ++e) {
+                    obs.on_checked(1);
+                    obs.on_pruned(PruneStage::PART, el_ivf_ids[e], static_cast<double>(p_order[pi].lb_part_sq));
+                }
+            }
+            continue;
+        }
+
+        const uint32_t part_cand_count = e_end - e_start;
+        const uint32_t quarters_before_part = quarter_evals;
+
+        float dc_low = p_order[pi].dc_low;
+        float dc_high = p_order[pi].dc_high;
+        const GeometricPartition& gp = idx.partitions[pid];
+
+        /* Etapa 2 (Radial): Poda Exacta Conservadora de Cascara Radial [r_low, r_high] */
+        float r_low = 0.0f, r_high = 0.0f, r_pad = 0.0f;
+        compute_radial_shell_interval(dc_low, dc_high, gp.max_radius, heap.threshold_sq, r_low, r_high, r_pad);
+
+        uint32_t orig_e_start = e_start;
+        uint32_t orig_e_end = e_end;
+
+        if (r_low > gp.min_radius) {
+            uint32_t lo = e_start, hi = e_end;
+            while (lo < hi) {
+                uint32_t mid = lo + ((hi - lo) >> 1);
+                if (idx.part_aos_radii[el_ivf_ids[mid]] < r_low) lo = mid + 1;
+                else hi = mid;
+            }
+            e_start = lo;
+        }
+        if (r_high < gp.max_radius && e_start < e_end) {
+            uint32_t lo = e_start, hi = e_end;
+            while (lo < hi) {
+                uint32_t mid = lo + ((hi - lo) >> 1);
+                if (idx.part_aos_radii[el_ivf_ids[mid]] <= r_high) lo = mid + 1;
+                else hi = mid;
+            }
+            e_end = lo;
+        }
+
+        if constexpr (AuditMode) {
+            const double one_m_g66_down = one_minus_gamma_down_f64(66);
+            for (uint32_t e = orig_e_start; e < e_start; ++e) {
+                uint32_t iv = el_ivf_ids[e];
+                obs.on_checked(1);
+                double r_x = static_cast<double>(idx.part_aos_radii[iv]);
+                double raw_rad = sub_down_f64(sub_down_f64(static_cast<double>(dc_low), r_x),
+                                              static_cast<double>(r_pad));
+                float lb_rad_sq = round_down_f32(mul_down_f64(mul_down_f64(raw_rad, raw_rad), one_m_g66_down));
+                obs.on_pruned(PruneStage::RADIAL, iv, static_cast<double>(lb_rad_sq));
+            }
+            for (uint32_t e = e_end; e < orig_e_end; ++e) {
+                uint32_t iv = el_ivf_ids[e];
+                obs.on_checked(1);
+                double r_x = static_cast<double>(idx.part_aos_radii[iv]);
+                double raw_rad = sub_down_f64(sub_down_f64(r_x, static_cast<double>(dc_high)),
+                                              static_cast<double>(r_pad));
+                float lb_rad_sq = round_down_f32(mul_down_f64(mul_down_f64(raw_rad, raw_rad), one_m_g66_down));
+                obs.on_pruned(PruneStage::RADIAL, iv, static_cast<double>(lb_rad_sq));
+            }
+        }
+
+        if (e_start < e_end) {
+            parts_visited++;
+            alignas(64) float q_rot_p[64];
+            const float* rot_c = idx.rotated_centroids + static_cast<size_t>(pid) * 64U;
+            __m256 v_tail16_31 = _mm256_setzero_ps();
+            __m256 v_tail32_63 = _mm256_setzero_ps();
+
+            for (uint32_t d = 0; d < 16; d += 8) {
+                __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+                _mm256_store_ps(q_rot_p + d, diff);
+            }
+            for (uint32_t d = 16; d < 32; d += 8) {
+                __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+                _mm256_store_ps(q_rot_p + d, diff);
+                v_tail16_31 = _mm256_fmadd_ps(diff, diff, v_tail16_31);
+            }
+            for (uint32_t d = 32; d < 64; d += 8) {
+                __m256 diff = _mm256_sub_ps(_mm256_load_ps(q_rot + d), _mm256_load_ps(rot_c + d));
+                _mm256_store_ps(q_rot_p + d, diff);
+                v_tail32_63 = _mm256_fmadd_ps(diff, diff, v_tail32_63);
+            }
+
+            float qt32_sq = hsum256_ps_fast(v_tail32_63);
+            float qt16_31_sq = hsum256_ps_fast(v_tail16_31);
+            float q_tail32_p = sqrtf(qt32_sq);
+            float q_tail48_p = sqrtf(qt32_sq + qt16_31_sq);
+
+            PartitionCertifiedBounds bounds = compute_partition_certified_bounds(
+                q_mean_norm, idx.centroid_mean_norms[pid], dc_high, gp.max_radius, idx.ortho_defect
+            );
+
+            uint32_t e = e_start;
+            for (; e + 4 <= e_end; e += 4) {
+                eval_4x_pca_progressive_unified<AuditMode>(
+                    q, q_rot_p, q_tail48_p, q_tail32_p,
+                    bounds, idx,
+                    el_ivf_ids[e], el_ivf_ids[e + 1], el_ivf_ids[e + 2], el_ivf_ids[e + 3],
+                    heap, quarter_evals, total_bytes, obs
+                );
+            }
+            for (; e < e_end; ++e) {
+                eval_1x_pca_progressive_unified<AuditMode>(
+                    q, q_rot_p, q_tail48_p, q_tail32_p,
+                    bounds, idx,
+                    el_ivf_ids[e],
+                    heap, quarter_evals, total_bytes, obs
+                );
+            }
+        }
+
+        /* Compuerta 3: Piloto empirico de 2 particiones al ingresar a la Zona Externa */
+        if (!pilot_checked) {
+            pilot_parts++;
+            pilot_vecs += part_cand_count;
+            pilot_quarters += (quarter_evals - quarters_before_part);
+            if (pilot_parts >= 2U && pilot_vecs >= 120U) {
+                pilot_checked = true;
+                if (static_cast<double>(pilot_quarters) > max_q_ratio * static_cast<double>(pilot_vecs)) {
+                    ++pi;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+template <bool AuditMode, typename Observer>
+static void run_plan6_adaptive_unified_core(const IVFPartitionedIndex& idx,
+                                            const float* q,
+                                            const QueryPredicate& pred,
+                                            uint32_t k,
+                                            TopKHeap& heap,
+                                            QueryExecutionMetrics& metrics,
+                                            TimerScope* opt_ts,
+                                            Observer& obs) {
+    const uint32_t dim = idx.dim;
+    const uint32_t n_parts = idx.num_partitions;
+
+    /* Fase Prep: Identica al baseline Plan 5A (sin pagar rotacion PCA por adelantado) */
+    PartitionOrder p_order[512];
+    for (uint32_t p = 0; p < n_parts; ++p) {
+        float d2 = l2_sq_avx2_1x_aos(q, idx.centroids + static_cast<size_t>(p) * dim, dim);
+        const GeometricPartition& gp = idx.partitions[p];
+        PartitionDistanceBounds pdb = compute_partition_distance_bounds(d2, gp.min_radius, gp.max_radius);
+        p_order[p] = {p, pdb.dc, pdb.dc_low, pdb.dc_high, pdb.lb_part_sq};
+    }
+    std::sort(p_order, p_order + n_parts, [](const PartitionOrder& a, const PartitionOrder& b) {
+        return a.dc < b.dc;
+    });
+
+    if (opt_ts) {
+        opt_ts->mark_prep_done();
+    }
+
+    heap.init(k);
+
+    const uint32_t* el_ivf_ids = idx.eligible_ivf_ids_per_sel[pred.sel_index].data();
+    const uint32_t* part_offs = idx.eligible_part_offsets_per_sel[pred.sel_index].data();
+
+    uint32_t quarter_evals = 0;
+    uint32_t parts_visited = 0;
+    uint64_t total_bytes = 0;
+
+    /*
+     * Fase 1 (Sembrado y Zona Interna en 5A):
+     * - Si 2*k < m_est (la bola Top-K cabe holgadamente en una sola particion, ej. Top-10),
+     *   basta poblar la primera particion semilla (`pi = 0`) con 5A.
+     * - Si 2*k >= m_est (la bola Top-K abarca multiples particiones, ej. Top-100),
+     *   barre con 5A la Zona Interna (`dc^2 <= 1.55 * theta_K^2`) donde la bola Top-K
+     *   se solapa con los nucleos de particion y provocaria caidas escalares a PCA32/PCA64.
+     */
+    const float m_est = static_cast<float>(pred.eligible_count) / static_cast<float>(n_parts);
+    const float inner_beta = (static_cast<float>(2U * k) < m_est) ? 0.0f : 1.55f;
+    const uint32_t min_seed_parts = (static_cast<float>(2U * k) < m_est) ? 1U : 3U;
+
+    uint32_t pi = 0;
+    uint32_t seed_nonempty_parts = 0;
+    for (; pi < n_parts; ++pi) {
+        uint32_t pid = p_order[pi].part_id;
+        uint32_t e_start = part_offs[pid];
+        uint32_t e_end = part_offs[pid + 1];
+        if (e_start >= e_end) continue;
+
+        if (heap.size == k && seed_nonempty_parts >= min_seed_parts) {
+            float dc_sq = p_order[pi].dc * p_order[pi].dc;
+            if (dc_sq > inner_beta * heap.threshold_sq) {
+                break;
+            }
+        }
+
+        eval_partition_5a_step<AuditMode>(
+            idx, q, el_ivf_ids, e_start, e_end, p_order[pi].lb_part_sq,
+            k, heap, quarter_evals, parts_visited, total_bytes, obs
+        );
+        seed_nonempty_parts++;
+    }
+
+    /*
+     * Evaluacion determinista del Modelo de Costo de 3 Compuertas al ingresar a la Zona Externa
+     */
+    bool use_5b_cascade = false;
+    double max_q_ratio = 1.95;
+    if (pi < n_parts && heap.size == k) {
+        uint32_t p_surv_5a = 0;
+        uint32_t n_surv_5a = 0;
+        for (uint32_t j = pi; j < n_parts; ++j) {
+            uint32_t pid_j = p_order[j].part_id;
+            uint32_t cnt_j = part_offs[pid_j + 1] - part_offs[pid_j];
+            if (cnt_j > 0 && p_order[j].lb_part_sq <= heap.threshold_sq) {
+                p_surv_5a++;
+                n_surv_5a += cnt_j;
+            }
+        }
+
+        /* Compuerta 1 (Suficiencia de Volumen Sobreviviente tras 5A): p_surv_5a > 32 y n_surv_5a > 4000 */
+        if (p_surv_5a > 32U && n_surv_5a > 4000U) {
+            float d_med = p_order[n_parts >> 1].dc;
+            float d_med_sq = d_med * d_med + 1.0e-12f;
+            float d0_sq = p_order[0].dc * p_order[0].dc;
+            float gamma_0 = d0_sq / d_med_sq;
+            float eta_pot = heap.threshold_sq / d_med_sq;
+            float m_bar = static_cast<float>(n_surv_5a) / static_cast<float>(p_surv_5a);
+
+            /*
+             * Compuerta 2:
+             * - gamma_0 <= 0.45f separa consultas concentradas en un cluster de consultas
+             *   uniformes/difusas en la esfera 64D (donde 5B nunca amortiza su sobrecarga).
+             * - eta_limit depende de la densidad media por particion m_bar = n_surv_5a / p_surv_5a
+             *   que amortiza el costo fijo O(D) de preparacion PCA por particion en 5B.
+             */
+            float eta_limit = (m_bar < 95.0f) ? 0.38f : 0.56f;
+            if (gamma_0 <= 0.45f && eta_pot <= eta_limit) {
+                use_5b_cascade = true;
+                max_q_ratio = (m_bar >= 150.0f) ? 2.15 : 1.95;
+            }
+        }
+    }
+
+    /*
+     * Fase 2 (Cascada Certificada 5B aislada en funcion noinline para evitar presion
+     * de registros XMM6-XMM15 sobre la ruta rapida 5A)
+     */
+    if (use_5b_cascade) {
+        run_plan6_phase2_5b_noinline<AuditMode>(
+            idx, q, p_order, el_ivf_ids, part_offs, max_q_ratio,
+            pi, heap, quarter_evals, parts_visited, total_bytes, obs
+        );
+    }
+
+    /*
+     * Fase 3 (Barrido Limpio 5A para las particiones restantes)
+     */
+    for (; pi < n_parts; ++pi) {
+        uint32_t pid = p_order[pi].part_id;
+        uint32_t e_start = part_offs[pid];
+        uint32_t e_end = part_offs[pid + 1];
+        if (e_start >= e_end) continue;
+
+        eval_partition_5a_step<AuditMode>(
+            idx, q, el_ivf_ids, e_start, e_end, p_order[pi].lb_part_sq,
+            k, heap, quarter_evals, parts_visited, total_bytes, obs
+        );
+    }
+
+    metrics.dists_evaluated = (quarter_evals + 2) / 4;
+    metrics.eligible_total = pred.eligible_count;
+    metrics.partitions_visited = parts_visited;
+    metrics.partitions_total = n_parts;
+    metrics.bytes_read = total_bytes;
+}
+
+void execute_plan6_ivf_adaptive_cost_model_avx2(const IVFPartitionedIndex& idx,
+                                                const float* q,
+                                                const QueryPredicate& pred,
+                                                uint32_t k,
+                                                Neighbor* out_results,
+                                                uint32_t* out_count,
+                                                QueryExecutionMetrics& metrics) {
+    memset(&metrics, 0, sizeof(metrics));
+    TimerScope ts;
+    ts.start();
+
+    /* Validacion intacta del contrato de ejecucion IEEE-754 */
+    const bool mxcsr_ok = check_ieee754_mxcsr_state();
+    if (!idx.certified_Contract_valid ||
+        !mxcsr_ok ||
+        !check_vector_domain_certified(q, idx.dim)) {
+        handle_ivf_non_nominal_contract_or_fallback(idx, q, pred, k, out_results, out_count, metrics, ts, mxcsr_ok);
+        return;
+    }
+    metrics.status = QueryExecutionStatus::OK_CERTIFIED;
+
+    TopKHeap heap;
+    NoOpPruneObserver noop_obs;
+    run_plan6_adaptive_unified_core<false>(idx, q, pred, k, heap, metrics, &ts, noop_obs);
+
+    heap.sort_ascending();
+    *out_count = heap.size;
+    memcpy(out_results, heap.data, heap.size * sizeof(Neighbor));
+
+    ts.stop(metrics);
+}
+
+void audit_plan6_adaptive_soundness(const IVFPartitionedIndex& idx,
+                                    const float* q,
+                                    const QueryPredicate& pred,
+                                    uint32_t k,
+                                    const Neighbor* true_topk,
+                                    uint32_t true_topk_count,
+                                    PruningAuditReport& report) {
+    if (!idx.certified_Contract_valid ||
+        !check_ieee754_mxcsr_state() ||
+        !check_vector_domain_certified(q, idx.dim)) {
+        report.contract_fallbacks++;
+        uint32_t n_el = static_cast<uint32_t>(idx.eligible_ivf_ids_per_sel[pred.sel_index].size());
+        report.total_eligible_checked += n_el;
+        report.evaluated_full_64d += n_el;
+        return;
+    }
+
+    struct AuditObserver6 {
+        const IVFPartitionedIndex& idx;
+        const float* q;
+        const Neighbor* true_topk;
+        uint32_t true_topk_count;
+        PruningAuditReport& report;
+
+        inline bool is_in_true_topk(uint32_t orig_id) const {
+            for (uint32_t t = 0; t < true_topk_count; ++t) {
+                if (true_topk[t].id == orig_id) return true;
+            }
+            return false;
+        }
+
+        inline void on_checked(uint32_t cnt) {
+            report.total_eligible_checked += cnt;
+        }
+
+        inline void on_evaluated_orig(uint32_t cnt) {
+            report.evaluated_full_64d += cnt;
+        }
+
+        inline void on_pruned(PruneStage stage, uint32_t iv, double lb_sq) {
+            uint64_t* p_stage_cnt = nullptr;
+            uint64_t* p_strict    = nullptr;
+            uint64_t* p_margin    = nullptr;
+            uint64_t* p_exceed    = nullptr;
+
+            switch (stage) {
+                case PruneStage::PART:
+                    p_stage_cnt = &report.pruned_by_partition;
+                    p_strict    = &report.strict_violations_partition;
+                    p_margin    = &report.diag_margin_events_partition;
+                    p_exceed    = &report.diag_exceed_violations_partition;
+                    break;
+                case PruneStage::RADIAL:
+                    p_stage_cnt = &report.pruned_by_radial_shell;
+                    p_strict    = &report.strict_violations_radial;
+                    p_margin    = &report.diag_margin_events_radial;
+                    p_exceed    = &report.diag_exceed_violations_radial;
+                    break;
+                case PruneStage::PCA16:
+                    p_stage_cnt = &report.pruned_by_pca_16d;
+                    p_strict    = &report.strict_violations_pca16;
+                    p_margin    = &report.diag_margin_events_pca16;
+                    p_exceed    = &report.diag_exceed_violations_pca16;
+                    break;
+                case PruneStage::PCA32:
+                    p_stage_cnt = &report.pruned_by_pca_32d;
+                    p_strict    = &report.strict_violations_pca32;
+                    p_margin    = &report.diag_margin_events_pca32;
+                    p_exceed    = &report.diag_exceed_violations_pca32;
+                    break;
+                case PruneStage::PCA64:
+                    p_stage_cnt = &report.pruned_by_pca_64d;
+                    p_strict    = &report.strict_violations_pca64;
+                    p_margin    = &report.diag_margin_events_pca64;
+                    p_exceed    = &report.diag_exceed_violations_pca64;
+                    break;
+            }
+
+            (*p_stage_cnt)++;
+
+            uint32_t orig_id = idx.part_aos_ids[iv];
+            const float* base_orig = idx.part_orig_vectors;
+            double orig_d2 = static_cast<double>(l2_hito9_ref(q, base_orig + static_cast<size_t>(iv) * idx.dim, idx.dim));
+
+            double signed_excess = lb_sq - orig_d2;
+            if (signed_excess > report.max_signed_excess) {
+                report.max_signed_excess = signed_excess;
+            }
+
+            if (signed_excess > 0.0) {
+                (*p_strict)++;
+                if (signed_excess > report.max_positive_excess) {
+                    report.max_positive_excess = signed_excess;
+                }
+                double diag_thresh = orig_d2 * ieee754_gamma(66);
+                if (signed_excess <= diag_thresh) {
+                    (*p_margin)++;
+                } else {
+                    (*p_exceed)++;
+                }
+            }
+
+            if (lb_sq > 0.0) {
+                double ratio = orig_d2 / lb_sq;
+                if (ratio < report.min_ratio_orig_over_lb) {
+                    report.min_ratio_orig_over_lb = ratio;
+                }
+            }
+            if (is_in_true_topk(orig_id)) {
+                report.false_prunings_topk++;
+            }
+        }
+    };
+
+    TopKHeap heap;
+    QueryExecutionMetrics dummy_metrics{};
+    AuditObserver6 audit_obs{idx, q, true_topk, true_topk_count, report};
+    run_plan6_adaptive_unified_core<true>(idx, q, pred, k, heap, dummy_metrics, nullptr, audit_obs);
+}
+
 } // namespace alg_flat

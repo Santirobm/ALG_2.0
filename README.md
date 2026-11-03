@@ -1,7 +1,7 @@
 # ALG-Flat 2.0: Motor Vectorial Exacto en Espacio Plano con Poda Geométrica Certificada en IEEE-754
 
-> **Estado del Proyecto:** **Hito 1 + Hito 2A.3 Completados y Certificados** (Ablación Física de 9 Planes + Contrato Formal de Entorno IEEE-754 con Separación de 5 Casos: `MXCSR` restaurado temporalmente, Fallback Seguro en $(10^{15}, 10^{18}]$, Rechazo Explícito de Consultas No Procesables $>10^{18}$/`NaN`/`Inf` y Rechazo de Corpus Inválido en Construcción + Aritmética de Intervalos con Redondeo hacia Afuera en `binary64` verificada contra Oráculo `DoubleDouble` de 106 bits + Kernel Unificado Templado de 5 Etapas con **Cero Tolerancia Oculta** $\Delta = LB_{\text{safe}}^2 - d_{\text{orig}}^2 \le 0$).  
-> **Barrera Metodológica:** **Hito 2A.3** cerrado en `main`; **Hito 2B** (Selector Adaptativo Ligero) desarrollado en rama independiente `hito2b-adaptive-selector` sin modificar las cotas ni el contrato matemático de `5A`/`5B`, manteniendo **Hito 2C** bloqueado.
+> **Estado del Proyecto:** **Hito 1 + Hito 2A.3 Completados y Certificados** en `main` | **Hito 2B (Plan 6: Selector Adaptativo por Modelo de Coste)** implementado y validado en la rama aislada `hito2b-adaptive-selector`.  
+> **Barrera Metodológica:** `main` permanece congelado en Hito 2A.3 (commit `0874d19`). Los kernels certificados `Plan 5A` y `Plan 5B` y las cotas de [`include/ieee754_bounds.h`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/include/ieee754_bounds.h) se mantienen **100% inalterados**. Hito 2C (cuantización int8 / SQ8) permanece bloqueado.
 
 ---
 
@@ -100,6 +100,7 @@ $$\text{Part} + \text{Radial} + \text{PCA16} + \text{PCA32} + \text{PCA64} + \te
 | **Plan 4** | `4_IVF_Flat_AVX2` | `IVF` Contiguo | AVX2 FMA 4x por partición | **Ninguna (0%)** | Ganancia pura por **localidad física de memoria** (evaluando exactamente los mismos 15,077 vectores). |
 | **Plan 5A** | `5A_IVF_PartPrune_AVX2` | `IVF` Contiguo | AVX2 FMA 4x por partición | **Esfera de Partición** ($LB_{\text{part}}^2 > \theta_K^2$) | Ganancia por saltar particiones completas sin tocar sus vectores. |
 | **Plan 5B** | `5B_IVF_FullExactPrune_AVX2` | `IVF` Centrado + PCA | Cascada unificada `16D -> 32D -> 64D` + dist. original | **5 Etapas: Partición + Radial + PCA 16D/32D/64D** | Ganancia por poda geométrica multinivel exacta certificada en IEEE-754. |
+| **Plan 6** | `6_IVF_Adaptive_CostModel_AVX2` | `IVF` Centrado + PCA | Adaptativo: Barrido AVX2 4x (`5A`) + Cascada `5B` (`noinline`) | **Poda Adaptativa Dinámica** con modelo de coste determinista | Minimizar $T_{\text{total}} = T_{\text{prep}} + T_{\text{calc}}$ acotando la cola $p95$ sin pérdida de exactitud (`100%` recall/rank). |
 
 ---
 
@@ -126,6 +127,7 @@ $$\text{Part} + \text{Radial} + \text{PCA16} + \text{PCA32} + \text{PCA64} + \te
 | **`4_IVF_Flat_AVX2`** | 3.1 | 117.4 | 113.2 | 147.6 | 120.5 | 19.9 | 0.0% | 465.4 | 482.2 | `100.0%` / `100.0%` |
 | **`5A_IVF_PartPrune_AVX2`** | 8.4 | 21.4 | **17.9** | **110.1** | **29.8** | **4.9** | **87.2%** | **31.5** | **44.0** | **`100.0%` / `100.0%`** |
 | **`5B_IVF_FullExactPrune_AVX2`** | 8.7 | 25.9 | **20.4** | **133.9** | **34.6** | **5.7** | **95.0%** | **40.1** | **52.5** | **`100.0%` / `100.0%`** |
+| **`6_IVF_Adaptive_CostModel_AVX2`** | 8.7 | 32.0 | **19.5** | **170.9** | **40.7** | **6.7** | **87.2%** | **43.0** | **59.3** | **`100.0%` / `100.0%`** |
 
 - **Para `Top-10` en este mismo escenario (`WARM_CACHE`):** `5A` alcanza **`p50 = 11.5 µs`** (`Mean = 21.9 µs`, `p95 = 94.1 µs`, **10.9x más rápido** que `Plan 0` en `p50`), y `5B` alcanza **`p50 = 14.0 µs`** (`Mean = 25.7 µs`, `p95 = 101.9 µs`) podando el **96.0%** de los vectores con `100.000%` de `IDSetRecall` y `RankMatch`.
 - **En `COLD_LLC_FLUSH` (tras expulsar L3 con 36 MB):** `Plan 0` se degrada a **534.6 µs** (`p50`) / **596.3 µs** (`Mean`), mientras que `5A` (**31.5 µs**, `Mean = 44.0 µs`) y `5B` (**40.1 µs**, `Mean = 52.5 µs`, `p95 = 74.9 µs`) logran un speedup de **13.3x–17.0x en `p50`** (**11.4x–13.5x en media**) porque leen de DRAM únicamente el ~3.4% de las particiones relevantes.
@@ -143,6 +145,7 @@ En este régimen, el radio del Top-$100$ supera la distancia a los bordes de la 
 | **`4_IVF_Flat_AVX2`** | 3.2 | 125.3 | **127.2** | 149.4 | **128.5** | 21.2 | 0.0% | 501.6 | 516.2 | `100.0%` / `100.0%` |
 | **`5A_IVF_PartPrune_AVX2`** | 8.6 | 126.8 | 132.9 | **145.5** | 135.4 | 22.4 | 0.0% | 445.6 | 471.7 | `100.0%` / `100.0%` |
 | **`5B_IVF_FullExactPrune_AVX2`** | 9.9 | 139.7 | 132.2 | 260.7 | 149.6 | 24.7 | **66.5%** | **326.5** | **366.2** | **`100.0%` / `100.0%`** |
+| **`6_IVF_Adaptive_CostModel_AVX2`** | 8.9 | 181.9 | 166.3 | 347.3 | 190.8 | 31.6 | 59.9% | 499.9 | 527.3 | **`100.0%` / `100.0%`** |
 
 - **Para `Top-10` en `R_k64_s009_Base` (`WARM_CACHE`):** `5B` poda el **74.3%** de los vectores y reduce la latencia mediana `p50` a **93.0 µs** (`Mean = 107.2 µs`) frente a **125.6 µs** (`Mean = 132.1 µs`) de `Plan 0` y **106.3 µs** (`Mean = 114.2 µs`) de `Plan 4`.
 - **Para `Selectividad 25%` (`25,127` elegibles, `Top-100`, `WARM_CACHE`):** `5B` poda el **68.5%** de los candidatos y baja la mediana `p50` a **173.2 µs** (`Mean = 197.9 µs`) frente a **236.5 µs** (`Mean = 248.4 µs`) de `Plan 0` y **181.7 µs** (`Mean = 190.1 µs`) de `Plan 4`.
@@ -159,11 +162,13 @@ En este régimen, el radio del Top-$100$ supera la distancia a los bordes de la 
 | **`M5050_k64_s009`** | `4_IVF_Flat_AVX2` | 132.3 | 160.6 | 136.0 | 0.0% | **465.4** | **487.3** | `100.0%` / `100.0%` |
 | **`M5050_k64_s009`** | `5A_IVF_PartPrune_AVX2` | 137.1 | 163.7 | 140.6 | 0.0% | 467.5 | 490.7 | `100.0%` / `100.0%` |
 | **`M5050_k64_s009`** | `5B_IVF_FullExactPrune_AVX2` | 227.0 | 277.0 | 197.1 | 45.5% | 612.3 | 544.4 | `100.0%` / `100.0%` |
+| **`M5050_k64_s009`** | `6_IVF_Adaptive_CostModel_AVX2` | **191.1** | **368.2** | **223.1** | 30.1% | **547.0** | **587.6** | `100.0%` / `100.0%` |
 | **`D_k64_s009_Adv`** | `0_Ref_Hito9_ExactScan` | 168.7 | 194.7 | 172.4 | 0.0% | 493.5 | 462.9 | `100.0%` / `100.0%` |
 | **`D_k64_s009_Adv`** | `2B_Flat_AVX2_AoS_4x` | 129.4 | 183.2 | 142.1 | 0.0% | 479.7 | 499.0 | `100.0%` / `100.0%` |
 | **`D_k64_s009_Adv`** | `4_IVF_Flat_AVX2` | **122.0** | 163.7 | 130.7 | 0.0% | **471.4** | **488.0** | `100.0%` / `100.0%` |
 | **`D_k64_s009_Adv`** | `5A_IVF_PartPrune_AVX2` | 124.1 | **145.5** | **127.3** | 0.0% | 471.8 | 496.1 | `100.0%` / `100.0%` |
 | **`D_k64_s009_Adv`** | `5B_IVF_FullExactPrune_AVX2` | 238.3 | 276.4 | 240.7 | 24.2% | 585.6 | 599.5 | `100.0%` / `100.0%` |
+| **`D_k64_s009_Adv`** | `6_IVF_Adaptive_CostModel_AVX2` | **155.8** | **190.0** | **157.1** | **0.0% (100% 5A)** | **705.4** | **709.9** | `100.0%` / `100.0%` |
 
 ---
 

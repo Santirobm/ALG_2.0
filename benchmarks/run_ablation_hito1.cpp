@@ -222,7 +222,7 @@ int main() {
                 execute_plan0_ref_hito9(aos_idx, ds.queries[q].values, pred, k, gt_all[q].data(), &gt_cnts[q], m_gt);
             }
 
-            const int num_plans = 9;
+            const int num_plans = 10;
             const char* plan_names[num_plans] = {
                 "0_Ref_Hito9_ExactScan",
                 "1_Flat_Scalar_AoS",
@@ -232,7 +232,8 @@ int main() {
                 "3B_Flat_AVX2_AoSoA",
                 "4_IVF_Flat_AVX2",
                 "5A_IVF_PartPrune_AVX2",
-                "5B_IVF_FullExactPrune_AVX2"
+                "5B_IVF_FullExactPrune_AVX2",
+                "6_IVF_Adaptive_CostModel_AVX2"
             };
 
             double build_times[num_plans] = {
@@ -242,6 +243,7 @@ int main() {
                 aos_idx.build_time_ms,
                 soa_idx.build_time_ms,
                 aosoa_idx.build_time_ms,
+                ivf_idx.total_build_time_ms,
                 ivf_idx.total_build_time_ms,
                 ivf_idx.total_build_time_ms,
                 ivf_idx.total_build_time_ms
@@ -263,6 +265,7 @@ int main() {
                         else if (pid == 6) execute_plan4_ivf_flat_avx2(ivf_idx, qv, pred, k, w_out, &w_cnt, w_m);
                         else if (pid == 7) execute_plan5a_ivf_part_prune_avx2(ivf_idx, qv, pred, k, w_out, &w_cnt, w_m);
                         else if (pid == 8) execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, qv, pred, k, w_out, &w_cnt, w_m);
+                        else if (pid == 9) execute_plan6_ivf_adaptive_cost_model_avx2(ivf_idx, qv, pred, k, w_out, &w_cnt, w_m);
                     }
                 }
 
@@ -290,6 +293,7 @@ int main() {
                     else if (pid == 6) execute_plan4_ivf_flat_avx2(ivf_idx, qv, pred, k, q_out, &q_cnt, m);
                     else if (pid == 7) execute_plan5a_ivf_part_prune_avx2(ivf_idx, qv, pred, k, q_out, &q_cnt, m);
                     else if (pid == 8) execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, qv, pred, k, q_out, &q_cnt, m);
+                    else if (pid == 9) execute_plan6_ivf_adaptive_cost_model_avx2(ivf_idx, qv, pred, k, q_out, &q_cnt, m);
 
                     tot_lats[q] = m.total_us;
                     sum_prep += m.prep_us;

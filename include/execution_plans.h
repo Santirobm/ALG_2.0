@@ -172,6 +172,38 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                                     uint32_t true_topk_count,
                                     PruningAuditReport& report);
 
+/*
+ * Plan 6 (Hito 2B): Selector Adaptativo Ligero Guiado por Modelo de Costo (5A Baseline + 5B Condicional)
+ * Minimiza T_total = T_prep + T_calc manteniendo intactos el contrato matematico IEEE-754 y las cotas
+ * certificadas de 5A y 5B:
+ *   - Usa Plan 5A como baseline de ejecucion (sin pagar rotacion PCA en Prep).
+ *   - Tras poblar el Top-K inicial, evalua mediante 3 compuertas de costo (suficiencia de poda de
+ *     particion 5A, ratio de concentracion geometrica theta_K^2 / d_med^2 y piloto empirico de 2
+ *     particiones) si el ahorro esperado de la cascada 5B supera su sobrecarga fija y por candidato.
+ *   - Si la tasa de poda empirica en el piloto no amortiza el costo de 5B, conmuta inmediatamente
+ *     al barrido 4x AVX2 de Plan 5A para el resto de la consulta.
+ */
+void execute_plan6_ivf_adaptive_cost_model_avx2(const IVFPartitionedIndex& idx,
+                                                const float* q,
+                                                const QueryPredicate& pred,
+                                                uint32_t k,
+                                                Neighbor* out_results,
+                                                uint32_t* out_count,
+                                                QueryExecutionMetrics& metrics);
+
+/*
+ * Auditoria Nivel 3 Unificada para Plan 6 (Hito 2B): Verifica con cero tolerancia (Delta <= 0)
+ * todos los descartes realizados por Plan 6 tanto en modo 5A (Particion) como en modo 5B
+ * (Particion, Radial, PCA 16D, PCA 32D y PCA 64D).
+ */
+void audit_plan6_adaptive_soundness(const IVFPartitionedIndex& idx,
+                                    const float* q,
+                                    const QueryPredicate& pred,
+                                    uint32_t k,
+                                    const Neighbor* true_topk,
+                                    uint32_t true_topk_count,
+                                    PruningAuditReport& report);
+
 } // namespace alg_flat
 
 #endif // ALG_FLAT_EXECUTION_PLANS_H

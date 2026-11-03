@@ -761,18 +761,23 @@ static void run_certification_suite(const char* suite_name,
     uint32_t gt_cnt = 0, out_cnt = 0;
     QueryExecutionMetrics m{};
 
-    double id_set_r10[8] = {0}, id_set_r100[8] = {0};
-    uint64_t dup_id_errors[8] = {0};
-    uint64_t rank_matches_10[8] = {0}, rank_totals_10[8] = {0};
-    uint64_t rank_matches_100[8] = {0}, rank_totals_100[8] = {0};
-    double max_orig_dist_err[8] = {0};
+    double id_set_r10[9] = {0}, id_set_r100[9] = {0};
+    uint64_t dup_id_errors[9] = {0};
+    uint64_t rank_matches_10[9] = {0}, rank_totals_10[9] = {0};
+    uint64_t rank_matches_100[9] = {0}, rank_totals_100[9] = {0};
+    double max_orig_dist_err[9] = {0};
 
     PruningAuditReport audit{};
     audit.min_ratio_orig_over_lb = 1e30;
     audit.max_signed_excess = -1e30;
     audit.max_positive_excess = 0.0;
 
-    const char* names[8] = {
+    PruningAuditReport audit6{};
+    audit6.min_ratio_orig_over_lb = 1e30;
+    audit6.max_signed_excess = -1e30;
+    audit6.max_positive_excess = 0.0;
+
+    const char* names[9] = {
         "Plan 1  (Flat_Scalar_AoS)",
         "Plan 2A (Flat_AVX2_AoS_1x)",
         "Plan 2B (Flat_AVX2_AoS_4x)",
@@ -780,14 +785,15 @@ static void run_certification_suite(const char* suite_name,
         "Plan 3B (Flat_AVX2_AoSoA)",
         "Plan 4  (IVF_Flat_AVX2)",
         "Plan 5A (IVF_PartPrune_AVX2)",
-        "Plan 5B (IVF_FullExactPrune_AVX2)"
+        "Plan 5B (IVF_FullExactPrune_AVX2)",
+        "Plan 6  (IVF_Adaptive_CostModel)"
     };
 
     for (uint32_t q = 0; q < ds.header.num_queries; ++q) {
         const float* qv = ds.queries[q].values;
         execute_plan0_ref_hito9(aos_idx, qv, pred, k, gt, &gt_cnt, m);
 
-        for (int p = 0; p < 8; ++p) {
+        for (int p = 0; p < 9; ++p) {
             if (p == 0) execute_plan1_flat_scalar_aos(aos_idx, qv, pred, k, out, &out_cnt, m);
             else if (p == 1) execute_plan2a_flat_avx2_aos_1x(aos_idx, qv, pred, k, out, &out_cnt, m);
             else if (p == 2) execute_plan2b_flat_avx2_aos_4x(aos_idx, qv, pred, k, out, &out_cnt, m);
@@ -796,6 +802,7 @@ static void run_certification_suite(const char* suite_name,
             else if (p == 5) execute_plan4_ivf_flat_avx2(ivf_idx, qv, pred, k, out, &out_cnt, m);
             else if (p == 6) execute_plan5a_ivf_part_prune_avx2(ivf_idx, qv, pred, k, out, &out_cnt, m);
             else if (p == 7) execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, qv, pred, k, out, &out_cnt, m);
+            else if (p == 8) execute_plan6_ivf_adaptive_cost_model_avx2(ivf_idx, qv, pred, k, out, &out_cnt, m);
 
             id_set_r10[p] += compute_id_set_recall(out, out_cnt, gt, gt_cnt, 10, dup_id_errors[p]);
             id_set_r100[p] += compute_id_set_recall(out, out_cnt, gt, gt_cnt, 100, dup_id_errors[p]);
@@ -806,15 +813,16 @@ static void run_certification_suite(const char* suite_name,
                                               rank_matches_100[p], rank_totals_100[p], max_orig_dist_err[p]);
         }
 
-        /* Nivel 3: Auditar cada vector podado por Plan 5B en las 5 etapas mediante el kernel unificado */
+        /* Nivel 3: Auditar cada vector podado por Plan 5B y Plan 6 en las 5 etapas mediante el kernel unificado */
         audit_plan5b_pruning_soundness(ivf_idx, qv, pred, k, gt, gt_cnt, audit);
+        audit_plan6_adaptive_soundness(ivf_idx, qv, pred, k, gt, gt_cnt, audit6);
     }
 
     double nq = static_cast<double>(ds.header.num_queries);
     printf("%-34s | %12s | %13s | %12s | %13s | %7s | %13s\n",
            "Plan", "IDSetRec@10", "IDSetRec@100", "RankMatch@10", "RankMatch@100", "DupIDs", "MaxOrigDistErr");
     printf("-----------------------------------------------------------------------------------------------------------------------\n");
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 9; ++i) {
         double r10 = (id_set_r10[i] / nq) * 100.0;
         double r100 = (id_set_r100[i] / nq) * 100.0;
         double rm10 = 100.0 * static_cast<double>(rank_matches_10[i]) / static_cast<double>(rank_totals_10[i]);
@@ -830,6 +838,24 @@ static void run_certification_suite(const char* suite_name,
         assert(rm100 == 100.0 && "Nivel 1B fallo: RankMatch@100 debe ser 100.0000%!");
         assert(max_orig_dist_err[i] == 0.0 && "Nivel 2 fallo: La distancia debe coincidir bit a bit en espacio original!");
     }
+
+    uint64_t total_pruned6 = audit6.pruned_by_partition
+                           + audit6.pruned_by_radial_shell
+                           + audit6.pruned_by_pca_16d
+                           + audit6.pruned_by_pca_32d
+                           + audit6.pruned_by_pca_64d;
+    uint64_t total_accounted6 = total_pruned6 + audit6.evaluated_full_64d;
+    assert(audit6.contract_fallbacks == 0 && total_accounted6 == audit6.total_eligible_checked);
+    assert(audit6.strict_violations_partition == 0 && audit6.strict_violations_radial == 0 &&
+           audit6.strict_violations_pca16 == 0 && audit6.strict_violations_pca32 == 0 &&
+           audit6.strict_violations_pca64 == 0 && audit6.false_prunings_topk == 0);
+    printf("  [Plan 6 Adaptive Audit] Elegibles=%llu | Podados(Part=%llu, Rad=%llu, PCA16=%llu, PCA32=%llu, PCA64=%llu) | Violaciones=0\n",
+           static_cast<unsigned long long>(audit6.total_eligible_checked),
+           static_cast<unsigned long long>(audit6.pruned_by_partition),
+           static_cast<unsigned long long>(audit6.pruned_by_radial_shell),
+           static_cast<unsigned long long>(audit6.pruned_by_pca_16d),
+           static_cast<unsigned long long>(audit6.pruned_by_pca_32d),
+           static_cast<unsigned long long>(audit6.pruned_by_pca_64d));
 
     uint64_t total_pruned = audit.pruned_by_partition
                           + audit.pruned_by_radial_shell

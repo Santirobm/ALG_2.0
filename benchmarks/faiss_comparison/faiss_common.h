@@ -10,6 +10,8 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 
 namespace alg_flat {
 
@@ -23,30 +25,78 @@ static inline uint64_t get_highres_time_ns() {
 }
 
 /*
- * Wrapper de alto rendimiento para interactuar con FAISS desde C++:
- * - Control estricto de hilos (omp_set_num_threads = 1).
- * - Cero E/S o invocacion de procesos externos por consulta.
- * - Reutilizacion de buffers de entrada/salida para no pagar asignaciones.
+ * Enlace directo C++ contra los simbolos exportados de faiss.dll (MSVC ABI).
+ * Se ejecutan sin intermediacion de CPython, sin asignacion de PyObjects,
+ * sin construccion de tuplas/diccionarios ni conversion de NumPy dentro del cronometro.
  */
-class FaissEngine {
+extern "C" {
+    void faiss_IndexFlat_search(
+        const void* this_ptr,
+        int64_t n,
+        const float* x,
+        int64_t k,
+        float* distances,
+        int64_t* labels,
+        const void* params) asm("?search@IndexFlat@faiss@@UEBAX_JPEBM0PEAMPEA_JPEBUSearchParameters@2@@Z");
+
+    void faiss_IndexIVF_search(
+        const void* this_ptr,
+        int64_t n,
+        const float* x,
+        int64_t k,
+        float* distances,
+        int64_t* labels,
+        const void* params) asm("?search@IndexIVF@faiss@@UEBAX_JPEBM0PEAMPEA_JPEBUSearchParameters@2@@Z");
+}
+
+/*
+ * Motor C++ de FAISS 1.15.1 de latencia pura:
+ * - Instancia indices mediante API CPython una unica vez durante setup.
+ * - Extrae los punteros nativos directos a la estructura en memoria.
+ * - Ejecuta la busqueda llamando directamente al metodo C++ de la DLL.
+ * - 1 Hilo OpenMP forzado (omp_set_num_threads = 1).
+ */
+class FaissNativeEngine {
     PyObject* pModuleFaiss_;
     PyObject* pIndexFlat_;
+    PyObject* pQuantizer_;
     PyObject* pIndexIVF_;
-    PyObject* pParamsFlatBitmap_;
-    PyObject* pParamsIVFBitmap_;
-    PyObject* pSearchFlatFunc_;
-    PyObject* pSearchIVFFunc_;
-    PyObject* pQueryArray_;
-    float* pQueryBuffer_;
+    PyObject* pSelectorBitmap_;
+    PyObject* pParamsFlat_;
+    PyObject* pParamsIVF_;
+
+    void* raw_flat_ptr_;
+    void* raw_ivf_ptr_;
+    void* raw_params_flat_;
+    void* raw_params_ivf_;
+
     uint32_t dim_;
     uint32_t num_vectors_;
 
+    std::vector<float> dist_buf_;
+    std::vector<int64_t> label_buf_;
+
 public:
-    FaissEngine() : pModuleFaiss_(nullptr), pIndexFlat_(nullptr), pIndexIVF_(nullptr),
-                    pParamsFlatBitmap_(nullptr), pParamsIVFBitmap_(nullptr),
-                    pSearchFlatFunc_(nullptr), pSearchIVFFunc_(nullptr),
-                    pQueryArray_(nullptr), pQueryBuffer_(nullptr),
-                    dim_(0), num_vectors_(0) {}
+    FaissNativeEngine()
+        : pModuleFaiss_(nullptr), pIndexFlat_(nullptr), pQuantizer_(nullptr),
+          pIndexIVF_(nullptr), pSelectorBitmap_(nullptr),
+          pParamsFlat_(nullptr), pParamsIVF_(nullptr),
+          raw_flat_ptr_(nullptr), raw_ivf_ptr_(nullptr),
+          raw_params_flat_(nullptr), raw_params_ivf_(nullptr),
+          dim_(0), num_vectors_(0) {
+        dist_buf_.resize(512, 0.0f);
+        label_buf_.resize(512, 0);
+    }
+
+    ~FaissNativeEngine() {
+        if (pParamsIVF_) { Py_DECREF(pParamsIVF_); pParamsIVF_ = nullptr; }
+        if (pParamsFlat_) { Py_DECREF(pParamsFlat_); pParamsFlat_ = nullptr; }
+        if (pSelectorBitmap_) { Py_DECREF(pSelectorBitmap_); pSelectorBitmap_ = nullptr; }
+        if (pIndexIVF_) { Py_DECREF(pIndexIVF_); pIndexIVF_ = nullptr; }
+        if (pQuantizer_) { Py_DECREF(pQuantizer_); pQuantizer_ = nullptr; }
+        if (pIndexFlat_) { Py_DECREF(pIndexFlat_); pIndexFlat_ = nullptr; }
+        if (pModuleFaiss_) { Py_DECREF(pModuleFaiss_); pModuleFaiss_ = nullptr; }
+    }
 
     bool init(uint32_t dim, uint32_t num_vectors, const float* raw_vectors) {
         dim_ = dim;
@@ -56,7 +106,7 @@ public:
             Py_Initialize();
         }
         if (_import_array() < 0) {
-            std::cerr << "Error: import_array() fallo en NumPy." << std::endl;
+            std::cerr << "Error: _import_array() fallo en NumPy." << std::endl;
             return false;
         }
 
@@ -66,7 +116,7 @@ public:
             return false;
         }
 
-        /* 1 hilo OpenMP estrictamente obligatorio */
+        /* 1 Hilo OpenMP estrictamente obligatorio */
         PyObject* pSetThreads = PyObject_GetAttrString(pModuleFaiss_, "omp_set_num_threads");
         if (pSetThreads) {
             PyObject* pArgs = Py_BuildValue("(i)", 1);
@@ -75,7 +125,10 @@ public:
             Py_DECREF(pSetThreads);
         }
 
-        /* 1. Crear e indexar IndexFlatL2 */
+        npy_intp dims_b[2] = { static_cast<npy_intp>(num_vectors), static_cast<npy_intp>(dim) };
+        PyObject* pXb = PyArray_SimpleNewFromData(2, dims_b, NPY_FLOAT32, const_cast<float*>(raw_vectors));
+
+        /* 1. Construir IndexFlatL2 nativo */
         PyObject* pClassIndexFlat = PyObject_GetAttrString(pModuleFaiss_, "IndexFlatL2");
         PyObject* pArgsFlat = Py_BuildValue("(i)", dim);
         pIndexFlat_ = PyObject_CallObject(pClassIndexFlat, pArgsFlat);
@@ -83,211 +136,154 @@ public:
         Py_DECREF(pClassIndexFlat);
         if (!pIndexFlat_) {
             PyErr_Print();
-            return false;
-        }
-
-        npy_intp dims_b[2] = { static_cast<npy_intp>(num_vectors), static_cast<npy_intp>(dim) };
-        PyObject* pXb = PyArray_SimpleNewFromData(2, dims_b, NPY_FLOAT32, const_cast<float*>(raw_vectors));
-        PyObject* pAddFunc = PyObject_GetAttrString(pIndexFlat_, "add");
-        PyObject* pAddArgs = Py_BuildValue("(O)", pXb);
-        PyObject* pAddRes = PyObject_CallObject(pAddFunc, pAddArgs);
-        Py_DECREF(pAddArgs);
-        Py_DECREF(pAddFunc);
-        if (pAddRes) {
-            Py_DECREF(pAddRes);
-        } else {
             Py_DECREF(pXb);
-            PyErr_Print();
             return false;
         }
 
-        /* 2. Crear, entrenar e indexar IndexIVFFlat (nlist = 128) */
+        PyObject* pAddFlat = PyObject_CallMethod(pIndexFlat_, "add", "O", pXb);
+        if (!pAddFlat) {
+            PyErr_Print();
+            Py_DECREF(pXb);
+            return false;
+        }
+        Py_DECREF(pAddFlat);
+
+        /* 2. Construir IndexIVFFlat nativo (nlist=128, METRIC_L2=0) */
         PyObject* pClassQuantizer = PyObject_GetAttrString(pModuleFaiss_, "IndexFlatL2");
-        PyObject* pArgsQ = Py_BuildValue("(i)", dim);
-        PyObject* pQuantizer = PyObject_CallObject(pClassQuantizer, pArgsQ);
-        Py_DECREF(pArgsQ);
+        PyObject* pArgsQuant = Py_BuildValue("(i)", dim);
+        pQuantizer_ = PyObject_CallObject(pClassQuantizer, pArgsQuant);
+        Py_DECREF(pArgsQuant);
         Py_DECREF(pClassQuantizer);
 
-        PyObject* pClassIVF = PyObject_GetAttrString(pModuleFaiss_, "IndexIVFFlat");
-        /* IndexIVFFlat(quantizer, dim, nlist, METRIC_L2) */
-        PyObject* pMetricL2 = PyObject_GetAttrString(pModuleFaiss_, "METRIC_L2");
-        PyObject* pArgsIVF = Py_BuildValue("(Oiii)", pQuantizer, dim, 128, PyLong_AsLong(pMetricL2));
-        Py_DECREF(pMetricL2);
-        pIndexIVF_ = PyObject_CallObject(pClassIVF, pArgsIVF);
+        PyObject* pClassIndexIVF = PyObject_GetAttrString(pModuleFaiss_, "IndexIVFFlat");
+        PyObject* pArgsIVF = Py_BuildValue("(Oiii)", pQuantizer_, dim, 128, 0);
+        pIndexIVF_ = PyObject_CallObject(pClassIndexIVF, pArgsIVF);
         Py_DECREF(pArgsIVF);
-        Py_DECREF(pClassIVF);
-        Py_DECREF(pQuantizer);
-
+        Py_DECREF(pClassIndexIVF);
         if (!pIndexIVF_) {
-            Py_DECREF(pXb);
             PyErr_Print();
+            Py_DECREF(pXb);
             return false;
         }
 
-        PyObject* pTrainFunc = PyObject_GetAttrString(pIndexIVF_, "train");
-        PyObject* pTrainArgs = Py_BuildValue("(O)", pXb);
-        PyObject* pTrainRes = PyObject_CallObject(pTrainFunc, pTrainArgs);
-        Py_DECREF(pTrainArgs);
-        Py_DECREF(pTrainFunc);
-        if (pTrainRes) {
-            Py_DECREF(pTrainRes);
-        } else {
-            Py_DECREF(pXb);
+        PyObject* pTrainIVF = PyObject_CallMethod(pIndexIVF_, "train", "O", pXb);
+        if (!pTrainIVF) {
             PyErr_Print();
+            Py_DECREF(pXb);
             return false;
         }
+        Py_DECREF(pTrainIVF);
 
-        PyObject* pAddIVFFunc = PyObject_GetAttrString(pIndexIVF_, "add");
-        PyObject* pAddIVFArgs = Py_BuildValue("(O)", pXb);
-        PyObject* pAddIVFRes = PyObject_CallObject(pAddIVFFunc, pAddIVFArgs);
-        Py_DECREF(pAddIVFArgs);
-        Py_DECREF(pAddIVFFunc);
+        PyObject* pAddIVF = PyObject_CallMethod(pIndexIVF_, "add", "O", pXb);
+        if (!pAddIVF) {
+            PyErr_Print();
+            Py_DECREF(pXb);
+            return false;
+        }
+        Py_DECREF(pAddIVF);
         Py_DECREF(pXb);
-        if (pAddIVFRes) {
-            Py_DECREF(pAddIVFRes);
-        } else {
-            PyErr_Print();
+
+        /* 3. Instanciar SearchParameters y SearchParametersIVF */
+        PyObject* pClassParams = PyObject_GetAttrString(pModuleFaiss_, "SearchParameters");
+        pParamsFlat_ = PyObject_CallObject(pClassParams, NULL);
+        Py_DECREF(pClassParams);
+
+        PyObject* pClassParamsIVF = PyObject_GetAttrString(pModuleFaiss_, "SearchParametersIVF");
+        pParamsIVF_ = PyObject_CallObject(pClassParamsIVF, NULL);
+        Py_DECREF(pClassParamsIVF);
+
+        /* 4. Extraer punteros nativos directos (desreferenciando swig.this) */
+        raw_flat_ptr_ = extract_native_ptr(pIndexFlat_);
+        raw_ivf_ptr_ = extract_native_ptr(pIndexIVF_);
+        raw_params_flat_ = extract_native_ptr(pParamsFlat_);
+        raw_params_ivf_ = extract_native_ptr(pParamsIVF_);
+
+        if (!raw_flat_ptr_ || !raw_ivf_ptr_ || !raw_params_flat_ || !raw_params_ivf_) {
+            std::cerr << "Error al extraer punteros nativos C++ de FAISS." << std::endl;
             return false;
         }
-
-        pSearchFlatFunc_ = PyObject_GetAttrString(pIndexFlat_, "search");
-        pSearchIVFFunc_ = PyObject_GetAttrString(pIndexIVF_, "search");
-
-        /* Buffer persistente para no pagar asignacion por consulta */
-        npy_intp dims_q[2] = { 1, static_cast<npy_intp>(dim) };
-        pQueryArray_ = PyArray_SimpleNew(2, dims_q, NPY_FLOAT32);
-        pQueryBuffer_ = static_cast<float*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(pQueryArray_)));
 
         return true;
     }
 
-    void set_ivf_nprobe(int nprobe) {
-        if (!pIndexIVF_) return;
-        PyObject_SetAttrString(pIndexIVF_, "nprobe", PyLong_FromLong(nprobe));
+    void set_ivf_nprobe(size_t nprobe) {
+        if (!raw_params_ivf_) return;
+        /* SearchParametersIVF: offset 16 es nprobe */
+        *reinterpret_cast<uint64_t*>(static_cast<char*>(raw_params_ivf_) + 16) = nprobe;
     }
 
     bool update_bitmap_filter(const uint8_t* bitmap_bytes, size_t num_bytes) {
-        if (pParamsFlatBitmap_) { Py_DECREF(pParamsFlatBitmap_); pParamsFlatBitmap_ = nullptr; }
-        if (pParamsIVFBitmap_) { Py_DECREF(pParamsIVFBitmap_); pParamsIVFBitmap_ = nullptr; }
+        if (pSelectorBitmap_) {
+            Py_DECREF(pSelectorBitmap_);
+            pSelectorBitmap_ = nullptr;
+        }
 
         npy_intp dims[1] = { static_cast<npy_intp>(num_bytes) };
         PyObject* pBmpArray = PyArray_SimpleNewFromData(1, dims, NPY_UINT8, const_cast<uint8_t*>(bitmap_bytes));
 
         PyObject* pClassSelector = PyObject_GetAttrString(pModuleFaiss_, "IDSelectorBitmap");
         PyObject* pArgsSel = Py_BuildValue("(O)", pBmpArray);
-        PyObject* pSelector = PyObject_CallObject(pClassSelector, pArgsSel);
+        pSelectorBitmap_ = PyObject_CallObject(pClassSelector, pArgsSel);
         Py_DECREF(pArgsSel);
         Py_DECREF(pClassSelector);
         Py_DECREF(pBmpArray);
-        if (!pSelector) {
+
+        if (!pSelectorBitmap_) {
             PyErr_Print();
             return false;
         }
 
-        PyObject* pClassParams = PyObject_GetAttrString(pModuleFaiss_, "SearchParameters");
-        PyObject* pKwFlat = PyDict_New();
-        PyDict_SetItemString(pKwFlat, "sel", pSelector);
-        pParamsFlatBitmap_ = PyObject_Call(pClassParams, PyTuple_New(0), pKwFlat);
-        Py_DECREF(pKwFlat);
+        void* raw_sel_ptr = extract_native_ptr(pSelectorBitmap_);
 
-        /* SearchParametersIVF para IVFFlat */
-        PyObject* pClassParamsIVF = PyObject_GetAttrString(pModuleFaiss_, "SearchParametersIVF");
-        PyObject* pKwIVF = PyDict_New();
-        PyDict_SetItemString(pKwIVF, "sel", pSelector);
-        pParamsIVFBitmap_ = PyObject_Call(pClassParamsIVF, PyTuple_New(0), pKwIVF);
-        Py_DECREF(pKwIVF);
-        Py_DECREF(pClassParamsIVF);
+        /* Asignar IDSelector* sel en SearchParameters (offset 8) */
+        *reinterpret_cast<void**>(static_cast<char*>(raw_params_flat_) + 8) = raw_sel_ptr;
+        *reinterpret_cast<void**>(static_cast<char*>(raw_params_ivf_) + 8) = raw_sel_ptr;
 
-        Py_DECREF(pClassParams);
-        Py_DECREF(pSelector);
-
-        return (pParamsFlatBitmap_ != nullptr && pParamsIVFBitmap_ != nullptr);
+        return true;
     }
 
-    void search_flat(const float* q, uint32_t k, Neighbor* out_res, uint32_t* out_count, double& out_time_us) {
-        memcpy(pQueryBuffer_, q, dim_ * sizeof(float));
-
-        PyObject* pArgs = PyTuple_New(2);
-        Py_INCREF(pQueryArray_);
-        PyTuple_SetItem(pArgs, 0, pQueryArray_);
-        PyTuple_SetItem(pArgs, 1, PyLong_FromLong(k));
-
-        PyObject* pKw = PyDict_New();
-        if (pParamsFlatBitmap_) PyDict_SetItemString(pKw, "params", pParamsFlatBitmap_);
-
+    /* Busqueda nativa C++ pura IndexFlatL2 */
+    inline void search_flat(const float* q, uint32_t k, Neighbor* out_res, uint32_t* out_count, double& out_time_us) {
         uint64_t t0 = get_highres_time_ns();
-        PyObject* pRes = PyObject_Call(pSearchFlatFunc_, pArgs, pKw);
+        faiss_IndexFlat_search(raw_flat_ptr_, 1, q, k, dist_buf_.data(), label_buf_.data(), raw_params_flat_);
         uint64_t t1 = get_highres_time_ns();
         out_time_us = static_cast<double>(t1 - t0) / 1000.0;
 
-        Py_DECREF(pArgs);
-        Py_DECREF(pKw);
-
-        if (pRes) {
-            PyObject* pDistArr = PyTuple_GetItem(pRes, 0);
-            PyObject* pIdArr = PyTuple_GetItem(pRes, 1);
-            float* dist_ptr = static_cast<float*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(pDistArr)));
-            int64_t* id_ptr = static_cast<int64_t*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(pIdArr)));
-
-            *out_count = k;
-            for (uint32_t i = 0; i < k; ++i) {
-                out_res[i].id = static_cast<uint32_t>(id_ptr[i]);
-                out_res[i].dist_sq = dist_ptr[i];
-            }
-            Py_DECREF(pRes);
-        } else {
-            PyErr_Print();
-            *out_count = 0;
+        *out_count = k;
+        for (uint32_t i = 0; i < k; ++i) {
+            out_res[i].id = static_cast<uint32_t>(label_buf_[i]);
+            out_res[i].dist_sq = dist_buf_[i];
         }
     }
 
-    void search_ivf(const float* q, uint32_t k, Neighbor* out_res, uint32_t* out_count, double& out_time_us) {
-        memcpy(pQueryBuffer_, q, dim_ * sizeof(float));
-
-        PyObject* pArgs = PyTuple_New(2);
-        Py_INCREF(pQueryArray_);
-        PyTuple_SetItem(pArgs, 0, pQueryArray_);
-        PyTuple_SetItem(pArgs, 1, PyLong_FromLong(k));
-
-        PyObject* pKw = PyDict_New();
-        if (pParamsIVFBitmap_) PyDict_SetItemString(pKw, "params", pParamsIVFBitmap_);
-
+    /* Busqueda nativa C++ pura IndexIVFFlat */
+    inline void search_ivf(const float* q, uint32_t k, Neighbor* out_res, uint32_t* out_count, double& out_time_us) {
         uint64_t t0 = get_highres_time_ns();
-        PyObject* pRes = PyObject_Call(pSearchIVFFunc_, pArgs, pKw);
+        faiss_IndexIVF_search(raw_ivf_ptr_, 1, q, k, dist_buf_.data(), label_buf_.data(), raw_params_ivf_);
         uint64_t t1 = get_highres_time_ns();
         out_time_us = static_cast<double>(t1 - t0) / 1000.0;
 
-        Py_DECREF(pArgs);
-        Py_DECREF(pKw);
-
-        if (pRes) {
-            PyObject* pDistArr = PyTuple_GetItem(pRes, 0);
-            PyObject* pIdArr = PyTuple_GetItem(pRes, 1);
-            float* dist_ptr = static_cast<float*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(pDistArr)));
-            int64_t* id_ptr = static_cast<int64_t*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(pIdArr)));
-
-            *out_count = k;
-            for (uint32_t i = 0; i < k; ++i) {
-                out_res[i].id = static_cast<uint32_t>(id_ptr[i]);
-                out_res[i].dist_sq = dist_ptr[i];
-            }
-            Py_DECREF(pRes);
-        } else {
-            PyErr_Print();
-            *out_count = 0;
+        *out_count = k;
+        for (uint32_t i = 0; i < k; ++i) {
+            out_res[i].id = static_cast<uint32_t>(label_buf_[i]);
+            out_res[i].dist_sq = dist_buf_[i];
         }
     }
 
-    ~FaissEngine() {
-        if (pQueryArray_) Py_DECREF(pQueryArray_);
-        if (pParamsFlatBitmap_) Py_DECREF(pParamsFlatBitmap_);
-        if (pParamsIVFBitmap_) Py_DECREF(pParamsIVFBitmap_);
-        if (pSearchFlatFunc_) Py_DECREF(pSearchFlatFunc_);
-        if (pSearchIVFFunc_) Py_DECREF(pSearchIVFFunc_);
-        if (pIndexFlat_) Py_DECREF(pIndexFlat_);
-        if (pIndexIVF_) Py_DECREF(pIndexIVF_);
-        if (pModuleFaiss_) Py_DECREF(pModuleFaiss_);
+private:
+    static void* extract_native_ptr(PyObject* py_obj) {
+        if (!py_obj) return nullptr;
+        PyObject* pThis = PyObject_GetAttrString(py_obj, "this");
+        if (!pThis) return nullptr;
+        PyObject* pLong = PyNumber_Long(pThis);
+        Py_DECREF(pThis);
+        if (!pLong) return nullptr;
+        void* ptr = reinterpret_cast<void*>(PyLong_AsLongLong(pLong));
+        Py_DECREF(pLong);
+        return ptr;
     }
 };
+
+
 
 } // namespace alg_flat

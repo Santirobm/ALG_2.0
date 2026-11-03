@@ -6,6 +6,7 @@
 *.ilk
 *.exp
 *.lib
+!third_party/faiss/faiss.lib
 *.dll
 
 # Large binary datasets

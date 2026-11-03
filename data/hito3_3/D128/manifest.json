@@ -1,0 +1,49 @@
+{
+  "format": "ALG-HITO3.3-F32-ROWMAJOR-v1",
+  "dataset": "lsb/simplewiki2023-all-minilm-l6-v2-embedding",
+  "config": null,
+  "source_split": "train",
+  "source_vector_column": "embedding",
+  "source_dimension": 384,
+  "dimension": 128,
+  "corpus_rows": 90000,
+  "query_rows": 10000,
+  "seed": 3303,
+  "query_fraction": 0.1,
+  "l2_normalized": true,
+  "projection": {
+    "type": "incremental_pca",
+    "source_dimension": 384,
+    "target_dimension": 128,
+    "fit_split": "corpus_only",
+    "explained_variance_ratio_sum": 0.7961075819560822,
+    "components_sha256": "1c956a719385768010dfd592e1968f3dba5c43bcdc2ed7931a297ee16920f493"
+  },
+  "metadata_columns": {
+    "id": "id_int",
+    "tenant": null,
+    "category": null,
+    "timestamp": null
+  },
+  "metadata_completeness": {
+    "tenant_id": 0.0,
+    "category": 0.0,
+    "timestamp": 0.0
+  },
+  "files": {
+    "corpus.f32": {
+      "sha256": "f7e5bd42c2e67bfad4e599ec4b2dddde0d23f0f9ed430ceda053343c8c6575c5",
+      "bytes": 46080000
+    },
+    "queries.f32": {
+      "sha256": "ebccc78d1374ff02f0bb0d08b3a57c90c5377e28d34c1affd1c33b6340fa12cb",
+      "bytes": 5120000
+    },
+    "corpus_metadata.jsonl": {
+      "sha256": "e57f05309281379e1aa23451eb23e72c1106f013928f23737e70865809713abb"
+    },
+    "query_metadata.jsonl": {
+      "sha256": "970864f989d133d8c32e3cf1c7c3cf3ba74fff079ef08a7cfcd0d5a48571bd31"
+    }
+  }
+}

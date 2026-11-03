@@ -1,14 +1,12 @@
 #include "../include/execution_plans.h"
 #include "../include/simd_kernels.h"
+#include "../include/ieee754_bounds.h"
 #include <queue>
 #include <vector>
 #include <algorithm>
 #include <cmath>
 
 namespace alg_flat {
-
-static constexpr float KERNEL_SUM_TREE_REL_EPS = 2.0e-5f;
-static constexpr float PART_FP_REL_EPS = 2.0e-5f;
 
 struct TimerScope {
     LARGE_INTEGER freq;
@@ -132,7 +130,7 @@ void execute_plan1_flat_scalar_aos(const FlatAoSIndex& idx,
         uint32_t id = el_ids[i];
         const float* vp = idx.vectors + static_cast<size_t>(id) * dim;
         float d = l2_sq_scalar_strict(q, vp, dim);
-        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
         if (d <= gate) {
             float d_exact = l2_hito9_ref(q, vp, dim);
             heap.push(id, d_exact);
@@ -174,7 +172,7 @@ void execute_plan2a_flat_avx2_aos_1x(const FlatAoSIndex& idx,
         uint32_t id = el_ids[i];
         const float* vp = idx.vectors + static_cast<size_t>(id) * dim;
         float d = l2_sq_avx2_1x_aos(q, vp, dim);
-        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
         if (d <= gate) {
             float d_exact = l2_hito9_ref(q, vp, dim);
             heap.push(id, d_exact);
@@ -226,7 +224,7 @@ void execute_plan2b_flat_avx2_aos_4x(const FlatAoSIndex& idx,
         const float* v3 = base_v + static_cast<size_t>(id3) * dim;
 
         __m128 d4 = l2_sq_avx2_4x_aos(q, v0, v1, v2, v3, dim);
-        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
         __m128 v_thresh = _mm_set1_ps(gate);
         int mask = _mm_movemask_ps(_mm_cmple_ps(d4, v_thresh));
         if (mask != 0) {
@@ -241,7 +239,7 @@ void execute_plan2b_flat_avx2_aos_4x(const FlatAoSIndex& idx,
         uint32_t id = el_ids[i];
         const float* vp = base_v + static_cast<size_t>(id) * dim;
         float d = l2_sq_avx2_1x_aos(q, vp, dim);
-        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
         if (d <= gate) {
             heap.push(id, l2_hito9_ref(q, vp, dim));
         }
@@ -292,7 +290,7 @@ void execute_plan3a_flat_avx2_soa(const FlatSoAIndex& idx,
 
         evaluated_blocks++;
         __m256 d8 = l2_sq_avx2_8x_soa(q, idx.soa_data, stride, vec_idx, dim);
-        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
         __m256 v_thresh = _mm256_set1_ps(gate);
         int hit_mask = _mm256_movemask_ps(_mm256_cmp_ps(d8, v_thresh, _CMP_LE_OS)) & elig_mask;
 
@@ -353,7 +351,7 @@ void execute_plan3b_flat_avx2_aosoa(const FlatAoSoAIndex& idx,
         evaluated_blocks++;
         const float* blk_ptr = idx.block_data + static_cast<size_t>(b) * dim * 8U;
         __m256 d8 = l2_sq_avx2_8x_aosoa(q, blk_ptr, dim);
-        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+        float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
         __m256 v_thresh = _mm256_set1_ps(gate);
         int hit_mask = _mm256_movemask_ps(_mm256_cmp_ps(d8, v_thresh, _CMP_LE_OS)) & elig_mask;
 
@@ -395,7 +393,7 @@ static inline void rotate_centered_query_avx2(const float* qt,
         _mm256_store_ps(q_diff + d, diff);
         v_norm_sq = _mm256_fmadd_ps(diff, diff, v_norm_sq);
     }
-    out_q_mean_norm = sqrtf(hsum256_ps_fast(v_norm_sq));
+    out_q_mean_norm = sqrtf(hsum256_ps_fast(v_norm_sq)) * (1.0f + GAMMA_66_F32);
 
     for (uint32_t r = 0; r < dim; ++r) {
         const float* row = qt + static_cast<size_t>(r) * dim;
@@ -412,9 +410,9 @@ static inline void rotate_centered_query_avx2(const float* qt,
 struct PartitionOrder {
     uint32_t part_id;
     float dc;       /* ||q - c_p||_2 en espacio original */
-    float dc_low;   /* Cota inferior conservadora de ||q - c_p||_2 */
-    float dc_high;  /* Cota superior conservadora de ||q - c_p||_2 */
-    float lb;       /* Cota inferior conservadora de distancia a la particion */
+    float dc_low;   /* dc * (1 - gamma_66) */
+    float dc_high;  /* dc * (1 + gamma_66) */
+    float lb_safe;  /* Cota inferior certificada en unidades de sqrt(fl_orig(||q-x||_2^2)) */
 };
 
 /*
@@ -473,7 +471,7 @@ void execute_plan4_ivf_flat_avx2(const IVFPartitionedIndex& idx,
 
             dists_eval += 4;
             __m128 d4 = l2_sq_avx2_4x_aos(q, v0, v1, v2, v3, dim);
-            float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+            float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
             int mask = _mm_movemask_ps(_mm_cmple_ps(d4, _mm_set1_ps(gate)));
             if (mask != 0) {
                 if (mask & 1) heap.push(idx.part_aos_ids[iv0], l2_hito9_ref(q, v0, dim));
@@ -487,7 +485,7 @@ void execute_plan4_ivf_flat_avx2(const IVFPartitionedIndex& idx,
             const float* vp = base_orig + static_cast<size_t>(iv) * dim;
             dists_eval++;
             float d = l2_sq_avx2_1x_aos(q, vp, dim);
-            float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+            float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
             if (d <= gate) {
                 heap.push(idx.part_aos_ids[iv], l2_hito9_ref(q, vp, dim));
             }
@@ -522,18 +520,19 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
 
     const uint32_t dim = idx.dim;
     const uint32_t n_parts = idx.num_partitions;
+    const float scale_part = (1.0f - GAMMA_66_F32) * (1.0f - 2.0f * U_F32);
 
     PartitionOrder p_order[512];
     for (uint32_t p = 0; p < n_parts; ++p) {
         float d2 = l2_sq_avx2_1x_aos(q, idx.centroids + static_cast<size_t>(p) * dim, dim);
         float dc = sqrtf(d2);
-        float dc_low = dc * (1.0f - PART_FP_REL_EPS);
-        float dc_high = dc * (1.0f + PART_FP_REL_EPS);
+        float dc_low = dc * (1.0f - GAMMA_66_F32);
+        float dc_high = dc * (1.0f + GAMMA_66_F32);
         const GeometricPartition& gp = idx.partitions[p];
-        float lb = 0.0f;
-        if (dc_low > gp.max_radius) lb = dc_low - gp.max_radius;
-        else if (dc_high < gp.min_radius) lb = gp.min_radius - dc_high;
-        p_order[p] = {p, dc, dc_low, dc_high, lb};
+        float raw_lb = 0.0f;
+        if (dc_low > gp.max_radius) raw_lb = dc_low - gp.max_radius;
+        else if (dc_high < gp.min_radius) raw_lb = gp.min_radius - dc_high;
+        p_order[p] = {p, dc, dc_low, dc_high, raw_lb * scale_part};
     }
     std::sort(p_order, p_order + n_parts, [](const PartitionOrder& a, const PartitionOrder& b) {
         return a.dc < b.dc;
@@ -558,8 +557,8 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
         if (e_start >= e_end) continue;
 
         if (heap.size == k) {
-            float safety_rho = sqrtf(heap.threshold_sq) * (1.0f + PART_FP_REL_EPS) + 1.0e-6f;
-            if (p_order[pi].lb > safety_rho) {
+            float lb_sq = (p_order[pi].lb_safe * p_order[pi].lb_safe) * (1.0f - 2.0f * U_F32);
+            if (lb_sq > heap.threshold_sq) {
                 continue;
             }
         }
@@ -579,7 +578,7 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
 
             dists_eval += 4;
             __m128 d4 = l2_sq_avx2_4x_aos(q, v0, v1, v2, v3, dim);
-            float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+            float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
             int mask = _mm_movemask_ps(_mm_cmple_ps(d4, _mm_set1_ps(gate)));
             if (mask != 0) {
                 if (mask & 1) heap.push(idx.part_aos_ids[iv0], l2_hito9_ref(q, v0, dim));
@@ -593,7 +592,7 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
             const float* vp = base_orig + static_cast<size_t>(iv) * dim;
             dists_eval++;
             float d = l2_sq_avx2_1x_aos(q, vp, dim);
-            float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + KERNEL_SUM_TREE_REL_EPS));
+            float gate = (heap.size < k) ? FLT_MAX : (heap.threshold_sq * (1.0f + SIMD_TREE_GATE_REL_EPS));
             if (d <= gate) {
                 heap.push(idx.part_aos_ids[iv], l2_hito9_ref(q, vp, dim));
             }
@@ -613,20 +612,13 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
 }
 
 /*
- * Kernel 4x1 Progresivo en Base Rotada PCA Centrada por Particion:
- *   - q_rot_p = Q^T * (q - c_p)
- *   - v_rot_p = Q^T * (x - c_p)
- *   - q_tail48_p = ||Q^T(q - c_p)[16..63]||_2  vs  part_aos_tail48_norm = ||Q^T(x - c_p)[16..63]||_2
- *   - q_tail32_p = ||Q^T(q - c_p)[32..63]||_2  vs  part_aos_tail32_norm = ||Q^T(x - c_p)[32..63]||_2
- *   - Distancia final de sobrevivientes evaluada en el espacio original float32 (`q` vs `part_orig_vectors`).
+ * Kernel 4x1 Progresivo en Base Rotada PCA Centrada por Particion con Cotas IEEE-754 Derivadas
  */
 static inline void eval_4x_pca_progressive_certified(const float* q_orig,
                                                      const float* q_rot_p,
                                                      float q_tail48_p,
                                                      float q_tail32_p,
-                                                     float fp_slack_p,
-                                                     float sq_slack_p,
-                                                     float scale_safe,
+                                                     const PartitionCertifiedBounds& bounds,
                                                      const IVFPartitionedIndex& idx,
                                                      uint32_t iv0, uint32_t iv1, uint32_t iv2, uint32_t iv3,
                                                      TopKHeap& heap,
@@ -665,23 +657,19 @@ static inline void eval_4x_pca_progressive_certified(const float* q_orig,
     quarter_evals += 4;
     bytes_read += 4 * 64 + 4 * sizeof(float);
 
-    /*
-     * Cota inferior conservadora en 16D + Cola 48D centrada en el centroide de la particion:
-     * LB_tail48 = max(0, | ||q_tail48 - c_tail48|| - ||x_tail48 - c_tail48|| | - fp_slack_p)
-     */
     __m128 b4 = _mm_set_ps(idx.part_aos_tail48_norm[iv3],
                            idx.part_aos_tail48_norm[iv2],
                            idx.part_aos_tail48_norm[iv1],
                            idx.part_aos_tail48_norm[iv0]);
     __m128 raw_diff = _mm_sub_ps(_mm_set1_ps(q_tail48_p), b4);
     __m128 abs_diff = _mm_andnot_ps(_mm_set1_ps(-0.0f), raw_diff);
-    __m128 lb_tail = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(abs_diff, _mm_set1_ps(fp_slack_p)));
-    __m128 d16_safe = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(d16_4, _mm_set1_ps(sq_slack_p)));
-    __m128 lb64_4 = _mm_mul_ps(_mm_fmadd_ps(lb_tail, lb_tail, d16_safe), _mm_set1_ps(scale_safe));
+    __m128 lb_tail = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(abs_diff, _mm_set1_ps(bounds.fp_slack_p)));
+    __m128 d16_safe = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(d16_4, _mm_set1_ps(bounds.sq_slack_p)));
+    __m128 lb64_4 = _mm_mul_ps(_mm_fmadd_ps(lb_tail, lb_tail, d16_safe), _mm_set1_ps(bounds.scale_safe));
 
     int mask16 = _mm_movemask_ps(_mm_cmple_ps(lb64_4, _mm_set1_ps(heap.threshold_sq)));
     if (mask16 == 0) {
-        return; /* Los 4 vectores quedan descartados con garantia matematica tras leer solo 1 cache line */
+        return;
     }
 
     alignas(16) float p16[4];
@@ -702,11 +690,11 @@ static inline void eval_4x_pca_progressive_certified(const float* q_orig,
         bytes_read += 64;
 
         float abs_t32 = std::fabs(q_tail32_p - idx.part_aos_tail32_norm[iv]);
-        float lb_t32 = (abs_t32 > fp_slack_p) ? (abs_t32 - fp_slack_p) : 0.0f;
-        float d32_safe = (d32 > sq_slack_p) ? (d32 - sq_slack_p) : 0.0f;
-        float lb64_stage2 = scale_safe * (d32_safe + lb_t32 * lb_t32);
+        float lb_t32 = (abs_t32 > bounds.fp_slack_p) ? (abs_t32 - bounds.fp_slack_p) : 0.0f;
+        float d32_safe = (d32 > bounds.sq_slack_p) ? (d32 - bounds.sq_slack_p) : 0.0f;
+        float lb64_stage2 = bounds.scale_safe * (d32_safe + lb_t32 * lb_t32);
         if (lb64_stage2 > heap.threshold_sq) {
-            continue; /* Podado exactamente en 32D con cota conservadora */
+            continue;
         }
 
         /* Etapa 3: Completar dimensiones 32..63 en espacio rotado */
@@ -722,8 +710,8 @@ static inline void eval_4x_pca_progressive_certified(const float* q_orig,
         quarter_evals += 2;
         bytes_read += 128;
 
-        float d64_safe = (d64_rot > sq_slack_p) ? (d64_rot - sq_slack_p) : 0.0f;
-        if (scale_safe * d64_safe <= heap.threshold_sq) {
+        float d64_safe = (d64_rot > bounds.sq_slack_p) ? (d64_rot - bounds.sq_slack_p) : 0.0f;
+        if (bounds.scale_safe * d64_safe <= heap.threshold_sq) {
             /* Nivel 2 de Certificacion: Recalcular distancia final exacta en el espacio original float32 */
             const float* orig_vp = idx.part_orig_vectors + static_cast<size_t>(iv) * 64U;
             float d_orig = l2_hito9_ref(q_orig, orig_vp, 64U);
@@ -750,17 +738,18 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
     float q_mean_norm = 0.0f;
     rotate_centered_query_avx2(idx.ortho_basis, q, idx.global_mean, q_rot, q_mean_norm, dim);
 
+    const float scale_part = (1.0f - GAMMA_66_F32) * (1.0f - 2.0f * U_F32);
     PartitionOrder p_order[512];
     for (uint32_t p = 0; p < n_parts; ++p) {
         float d2 = l2_sq_avx2_1x_aos(q, idx.centroids + static_cast<size_t>(p) * dim, dim);
         float dc = sqrtf(d2);
-        float dc_low = dc * (1.0f - PART_FP_REL_EPS);
-        float dc_high = dc * (1.0f + PART_FP_REL_EPS);
+        float dc_low = dc * (1.0f - GAMMA_66_F32);
+        float dc_high = dc * (1.0f + GAMMA_66_F32);
         const GeometricPartition& gp = idx.partitions[p];
-        float lb = 0.0f;
-        if (dc_low > gp.max_radius) lb = dc_low - gp.max_radius;
-        else if (dc_high < gp.min_radius) lb = gp.min_radius - dc_high;
-        p_order[p] = {p, dc, dc_low, dc_high, lb};
+        float raw_lb = 0.0f;
+        if (dc_low > gp.max_radius) raw_lb = dc_low - gp.max_radius;
+        else if (dc_high < gp.min_radius) raw_lb = gp.min_radius - dc_high;
+        p_order[p] = {p, dc, dc_low, dc_high, raw_lb * scale_part};
     }
 
     std::sort(p_order, p_order + n_parts, [](const PartitionOrder& a, const PartitionOrder& b) {
@@ -780,29 +769,27 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
     uint32_t parts_visited = 0;
     uint64_t total_bytes = 0;
 
-    const float scale_safe = 1.0f - 2.0f * (idx.ortho_defect + 2.0e-5f);
-
     for (uint32_t pi = 0; pi < n_parts; ++pi) {
         uint32_t pid = p_order[pi].part_id;
         uint32_t e_start = part_offs[pid];
         uint32_t e_end = part_offs[pid + 1];
         if (e_start >= e_end) continue;
 
-        float dc = p_order[pi].dc;
         float dc_low = p_order[pi].dc_low;
         float dc_high = p_order[pi].dc_high;
         const GeometricPartition& gp = idx.partitions[pid];
 
         if (heap.size == k) {
-            float rho_safe = sqrtf(heap.threshold_sq) * (1.0f + PART_FP_REL_EPS) + 1.0e-6f;
-            if (p_order[pi].lb > rho_safe) {
+            float lb_part_sq = (p_order[pi].lb_safe * p_order[pi].lb_safe) * (1.0f - 2.0f * U_F32);
+            if (lb_part_sq > heap.threshold_sq) {
                 continue; /* Nivel 1: Particion entera descartada con garantia conservadora */
             }
 
             /* Nivel 2: Poda Exacta Conservadora de Cascara Radial [r_low, r_high] */
-            float r_pad = PART_FP_REL_EPS * gp.max_radius + 1.0e-6f;
-            float r_low = dc_low - rho_safe - r_pad;
-            float r_high = dc_high + rho_safe + r_pad;
+            float rho_orig_upper = sqrtf(heap.threshold_sq) / scale_part;
+            float r_pad = U_F32 * gp.max_radius;
+            float r_low = dc_low - rho_orig_upper - r_pad;
+            float r_high = dc_high + rho_orig_upper + r_pad;
 
             if (r_low > gp.min_radius) {
                 uint32_t lo = e_start, hi = e_end;
@@ -828,7 +815,6 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
         parts_visited++;
         uint32_t e = e_start;
 
-        /* En la primera particion mientras se llena el heap, evaluar 4x1 directamente en espacio original */
         while (e + 4 <= e_end && heap.size < k) {
             uint32_t iv0 = el_ivf_ids[e];
             uint32_t iv1 = el_ivf_ids[e + 1];
@@ -857,13 +843,6 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
         }
         if (e >= e_end) continue;
 
-        /*
-         * Calcular residuo de consulta respecto del centroide de esta particion en base rotada:
-         *   q_rot_p = Q^T(q - mu) - Q^T(c_p - mu) = Q^T(q - c_p)
-         * y sus normas de cola respecto del centroide de la particion:
-         *   q_tail48_p = ||Q^T(q - c_p)[16..63]||_2
-         *   q_tail32_p = ||Q^T(q - c_p)[32..63]||_2
-         */
         alignas(64) float q_rot_p[64];
         const float* rot_c = idx.rotated_centroids + static_cast<size_t>(pid) * 64U;
         __m256 v_tail16_31 = _mm256_setzero_ps();
@@ -889,16 +868,13 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
         float q_tail32_p = sqrtf(qt32_sq);
         float q_tail48_p = sqrtf(qt32_sq + qt16_31_sq);
 
-        float max_vec_norm = dc_high + gp.max_radius;
-        float fp_slack_p = 8.0e-6f * (q_mean_norm + idx.centroid_mean_norms[pid] + gp.max_radius)
-                         + idx.ortho_defect * max_vec_norm
-                         + 1.0e-6f;
-        float sq_slack_p = 2.0f * fp_slack_p * max_vec_norm + 1.0e-6f;
+        PartitionCertifiedBounds bounds = compute_partition_certified_bounds(
+            q_mean_norm, idx.centroid_mean_norms[pid], dc_high, gp.max_radius, idx.ortho_defect
+        );
 
-        /* Con el umbral rho_K activo, usar el kernel 4x1 Progresivo PCA Centrado por Particion */
         for (; e + 4 <= e_end; e += 4) {
             eval_4x_pca_progressive_certified(q, q_rot_p, q_tail48_p, q_tail32_p,
-                                              fp_slack_p, sq_slack_p, scale_safe, idx,
+                                              bounds, idx,
                                               el_ivf_ids[e], el_ivf_ids[e + 1], el_ivf_ids[e + 2], el_ivf_ids[e + 3],
                                               heap, quarter_evals, total_bytes);
         }
@@ -914,9 +890,9 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
             total_bytes += 68;
 
             float abs_t48 = std::fabs(q_tail48_p - idx.part_aos_tail48_norm[iv]);
-            float lb_t48 = (abs_t48 > fp_slack_p) ? (abs_t48 - fp_slack_p) : 0.0f;
-            float d16_safe = (d16 > sq_slack_p) ? (d16 - sq_slack_p) : 0.0f;
-            if (scale_safe * (d16_safe + lb_t48 * lb_t48) > heap.threshold_sq) continue;
+            float lb_t48 = (abs_t48 > bounds.fp_slack_p) ? (abs_t48 - bounds.fp_slack_p) : 0.0f;
+            float d16_safe = (d16 > bounds.sq_slack_p) ? (d16 - bounds.sq_slack_p) : 0.0f;
+            if (bounds.scale_safe * (d16_safe + lb_t48 * lb_t48) > heap.threshold_sq) continue;
 
             __m256 qa = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 16), _mm256_load_ps(vp + 16));
             __m256 qb = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 24), _mm256_load_ps(vp + 24));
@@ -925,9 +901,9 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
             total_bytes += 64;
 
             float abs_t32 = std::fabs(q_tail32_p - idx.part_aos_tail32_norm[iv]);
-            float lb_t32 = (abs_t32 > fp_slack_p) ? (abs_t32 - fp_slack_p) : 0.0f;
-            float d32_safe = (d32 > sq_slack_p) ? (d32 - sq_slack_p) : 0.0f;
-            if (scale_safe * (d32_safe + lb_t32 * lb_t32) > heap.threshold_sq) continue;
+            float lb_t32 = (abs_t32 > bounds.fp_slack_p) ? (abs_t32 - bounds.fp_slack_p) : 0.0f;
+            float d32_safe = (d32 > bounds.sq_slack_p) ? (d32 - bounds.sq_slack_p) : 0.0f;
+            if (bounds.scale_safe * (d32_safe + lb_t32 * lb_t32) > heap.threshold_sq) continue;
 
             quarter_evals += 2;
             total_bytes += 256;
@@ -952,11 +928,10 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
 }
 
 /*
- * Auditoria Directa de Poda (Hito 2A - Nivel 3):
- * Verifica que para CADA vector elegible descartado en cualquiera de las 4 etapas
- * (Particion, Cascara Radial, PCA 16D+Tail48, PCA 32D+Tail32):
- *   1. Su cota inferior conservadora LB_safe^2(q, x) <= d_orig^2(q, x).
- *   2. Ningun vector descartado pertenece al conjunto exacto Top-K de referencia.
+ * Auditoria Directa de Poda sin Tolerancia Oculta (Hito 2A.1 - Nivel 3):
+ * Mide el exceso firmado exacto:
+ *   Delta(q, x) = LB_safe^2(q, x) - d_orig^2(q, x)
+ * sin ocultar ningun exceso positivo detras de una tolerancia.
  */
 void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                                     const float* q,
@@ -971,17 +946,18 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
     float q_mean_norm = 0.0f;
     rotate_centered_query_avx2(idx.ortho_basis, q, idx.global_mean, q_rot, q_mean_norm, dim);
 
+    const float scale_part = (1.0f - GAMMA_66_F32) * (1.0f - 2.0f * U_F32);
     PartitionOrder p_order[512];
     for (uint32_t p = 0; p < n_parts; ++p) {
         float d2 = l2_sq_avx2_1x_aos(q, idx.centroids + static_cast<size_t>(p) * dim, dim);
         float dc = sqrtf(d2);
-        float dc_low = dc * (1.0f - PART_FP_REL_EPS);
-        float dc_high = dc * (1.0f + PART_FP_REL_EPS);
+        float dc_low = dc * (1.0f - GAMMA_66_F32);
+        float dc_high = dc * (1.0f + GAMMA_66_F32);
         const GeometricPartition& gp = idx.partitions[p];
-        float lb = 0.0f;
-        if (dc_low > gp.max_radius) lb = dc_low - gp.max_radius;
-        else if (dc_high < gp.min_radius) lb = gp.min_radius - dc_high;
-        p_order[p] = {p, dc, dc_low, dc_high, lb};
+        float raw_lb = 0.0f;
+        if (dc_low > gp.max_radius) raw_lb = dc_low - gp.max_radius;
+        else if (dc_high < gp.min_radius) raw_lb = gp.min_radius - dc_high;
+        p_order[p] = {p, dc, dc_low, dc_high, raw_lb * scale_part};
     }
 
     std::sort(p_order, p_order + n_parts, [](const PartitionOrder& a, const PartitionOrder& b) {
@@ -994,7 +970,6 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
     const uint32_t* el_ivf_ids = idx.eligible_ivf_ids_per_sel[pred.sel_index].data();
     const uint32_t* part_offs = idx.eligible_part_offsets_per_sel[pred.sel_index].data();
     const float* base_orig = idx.part_orig_vectors;
-    const float scale_safe = 1.0f - 2.0f * (idx.ortho_defect + 2.0e-5f);
 
     auto is_in_true_topk = [&](uint32_t orig_id) -> bool {
         for (uint32_t t = 0; t < true_topk_count; ++t) {
@@ -1003,13 +978,37 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
         return false;
     };
 
-    auto record_pruned_check = [&](uint32_t iv, double lb_sq, uint64_t& stage_violations) {
+    auto record_pruned_check = [&](uint32_t iv,
+                                   double lb_sq,
+                                   uint64_t& strict_viol,
+                                   uint64_t& diag_margin_ev,
+                                   uint64_t& diag_exceed_viol) {
         uint32_t orig_id = idx.part_aos_ids[iv];
         double orig_d2 = static_cast<double>(l2_hito9_ref(q, base_orig + static_cast<size_t>(iv) * dim, dim));
-        if (lb_sq > orig_d2 * (1.0 + 1e-6) + 1e-7) {
-            stage_violations++;
+
+        /* Exceso firmado exacto: Delta = LB_safe^2 - d_orig^2 (sin ninguna tolerancia oculta) */
+        double signed_excess = lb_sq - orig_d2;
+        if (signed_excess > report.max_signed_excess) {
+            report.max_signed_excess = signed_excess;
         }
-        if (lb_sq > 1e-12) {
+
+        if (signed_excess > 0.0) {
+            /* Categoria 1: Violacion estricta (cualquier Delta > 0.0, tolerancia CERO) */
+            strict_viol++;
+            if (signed_excess > report.max_positive_excess) {
+                report.max_positive_excess = signed_excess;
+            }
+            double diag_thresh = orig_d2 * ieee754_gamma(66);
+            if (signed_excess <= diag_thresh) {
+                /* Categoria 2: Dentro del margen de redondeo del arbol de suma original */
+                diag_margin_ev++;
+            } else {
+                /* Categoria 3: Supera el umbral de diagnostico */
+                diag_exceed_viol++;
+            }
+        }
+
+        if (lb_sq > 0.0) {
             double ratio = orig_d2 / lb_sq;
             if (ratio < report.min_ratio_orig_over_lb) {
                 report.min_ratio_orig_over_lb = ratio;
@@ -1031,22 +1030,24 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
         const GeometricPartition& gp = idx.partitions[pid];
 
         if (heap.size == k) {
-            float rho_safe = sqrtf(heap.threshold_sq) * (1.0f + PART_FP_REL_EPS) + 1.0e-6f;
-            if (p_order[pi].lb > rho_safe) {
-                /* Auditar todos los vectores descartados por Poda de Particion */
-                double lb_part_safe = static_cast<double>(p_order[pi].lb) / (1.0 + PART_FP_REL_EPS);
-                double lb_part_sq = lb_part_safe * lb_part_safe;
+            float lb_part_sq = (p_order[pi].lb_safe * p_order[pi].lb_safe) * (1.0f - 2.0f * U_F32);
+            if (lb_part_sq > heap.threshold_sq) {
                 for (uint32_t e = e_start; e < e_end; ++e) {
                     report.total_eligible_checked++;
                     report.pruned_by_partition++;
-                    record_pruned_check(el_ivf_ids[e], lb_part_sq, report.bound_violations_partition);
+                    record_pruned_check(el_ivf_ids[e],
+                                        static_cast<double>(lb_part_sq),
+                                        report.strict_violations_partition,
+                                        report.diag_margin_events_partition,
+                                        report.diag_exceed_violations_partition);
                 }
                 continue;
             }
 
-            float r_pad = PART_FP_REL_EPS * gp.max_radius + 1.0e-6f;
-            float r_low = dc_low - rho_safe - r_pad;
-            float r_high = dc_high + rho_safe + r_pad;
+            float rho_orig_upper = sqrtf(heap.threshold_sq) / scale_part;
+            float r_pad = U_F32 * gp.max_radius;
+            float r_low = dc_low - rho_orig_upper - r_pad;
+            float r_high = dc_high + rho_orig_upper + r_pad;
 
             uint32_t orig_e_start = e_start;
             uint32_t orig_e_end = e_end;
@@ -1070,23 +1071,33 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                 e_end = lo;
             }
 
-            /* Auditar vectores descartados en la cascara radial interior [orig_e_start .. e_start) */
             for (uint32_t e = orig_e_start; e < e_start; ++e) {
                 uint32_t iv = el_ivf_ids[e];
                 report.total_eligible_checked++;
                 report.pruned_by_radial_shell++;
                 float r_x = idx.part_aos_radii[iv];
-                double lb_rad = std::max(0.0, static_cast<double>(dc_low - r_x - r_pad) / (1.0 + PART_FP_REL_EPS));
-                record_pruned_check(iv, lb_rad * lb_rad, report.bound_violations_radial);
+                float raw_rad = (dc_low > r_x + r_pad) ? (dc_low - r_x - r_pad) : 0.0f;
+                float lb_rad_safe = raw_rad * scale_part;
+                float lb_rad_sq = (lb_rad_safe * lb_rad_safe) * (1.0f - 2.0f * U_F32);
+                record_pruned_check(iv,
+                                    static_cast<double>(lb_rad_sq),
+                                    report.strict_violations_radial,
+                                    report.diag_margin_events_radial,
+                                    report.diag_exceed_violations_radial);
             }
-            /* Auditar vectores descartados en la cascara radial exterior [e_end .. orig_e_end) */
             for (uint32_t e = e_end; e < orig_e_end; ++e) {
                 uint32_t iv = el_ivf_ids[e];
                 report.total_eligible_checked++;
                 report.pruned_by_radial_shell++;
                 float r_x = idx.part_aos_radii[iv];
-                double lb_rad = std::max(0.0, static_cast<double>(r_x - dc_high - r_pad) / (1.0 + PART_FP_REL_EPS));
-                record_pruned_check(iv, lb_rad * lb_rad, report.bound_violations_radial);
+                float raw_rad = (r_x > dc_high + r_pad) ? (r_x - dc_high - r_pad) : 0.0f;
+                float lb_rad_safe = raw_rad * scale_part;
+                float lb_rad_sq = (lb_rad_safe * lb_rad_safe) * (1.0f - 2.0f * U_F32);
+                record_pruned_check(iv,
+                                    static_cast<double>(lb_rad_sq),
+                                    report.strict_violations_radial,
+                                    report.diag_margin_events_radial,
+                                    report.diag_exceed_violations_radial);
             }
 
             if (e_start >= e_end) continue;
@@ -1127,11 +1138,9 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
         float q_tail32_p = sqrtf(qt32_sq);
         float q_tail48_p = sqrtf(qt32_sq + qt16_31_sq);
 
-        float max_vec_norm = dc_high + gp.max_radius;
-        float fp_slack_p = 8.0e-6f * (q_mean_norm + idx.centroid_mean_norms[pid] + gp.max_radius)
-                         + idx.ortho_defect * max_vec_norm
-                         + 1.0e-6f;
-        float sq_slack_p = 2.0f * fp_slack_p * max_vec_norm + 1.0e-6f;
+        PartitionCertifiedBounds bounds = compute_partition_certified_bounds(
+            q_mean_norm, idx.centroid_mean_norms[pid], dc_high, gp.max_radius, idx.ortho_defect
+        );
 
         for (; e < e_end; ++e) {
             uint32_t iv = el_ivf_ids[e];
@@ -1143,12 +1152,16 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
             float d16 = hsum256_ps_fast(_mm256_fmadd_ps(q0, q0, _mm256_mul_ps(q1, q1)));
 
             float abs_t48 = std::fabs(q_tail48_p - idx.part_aos_tail48_norm[iv]);
-            float lb_t48 = (abs_t48 > fp_slack_p) ? (abs_t48 - fp_slack_p) : 0.0f;
-            float d16_safe = (d16 > sq_slack_p) ? (d16 - sq_slack_p) : 0.0f;
-            float lb64_s1 = scale_safe * (d16_safe + lb_t48 * lb_t48);
+            float lb_t48 = (abs_t48 > bounds.fp_slack_p) ? (abs_t48 - bounds.fp_slack_p) : 0.0f;
+            float d16_safe = (d16 > bounds.sq_slack_p) ? (d16 - bounds.sq_slack_p) : 0.0f;
+            float lb64_s1 = bounds.scale_safe * (d16_safe + lb_t48 * lb_t48);
             if (lb64_s1 > heap.threshold_sq) {
                 report.pruned_by_pca_16d++;
-                record_pruned_check(iv, static_cast<double>(lb64_s1), report.bound_violations_pca16);
+                record_pruned_check(iv,
+                                    static_cast<double>(lb64_s1),
+                                    report.strict_violations_pca16,
+                                    report.diag_margin_events_pca16,
+                                    report.diag_exceed_violations_pca16);
                 continue;
             }
 
@@ -1157,12 +1170,16 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
             float d32 = d16 + hsum256_ps_fast(_mm256_fmadd_ps(qa, qa, _mm256_mul_ps(qb, qb)));
 
             float abs_t32 = std::fabs(q_tail32_p - idx.part_aos_tail32_norm[iv]);
-            float lb_t32 = (abs_t32 > fp_slack_p) ? (abs_t32 - fp_slack_p) : 0.0f;
-            float d32_safe = (d32 > sq_slack_p) ? (d32 - sq_slack_p) : 0.0f;
-            float lb64_s2 = scale_safe * (d32_safe + lb_t32 * lb_t32);
+            float lb_t32 = (abs_t32 > bounds.fp_slack_p) ? (abs_t32 - bounds.fp_slack_p) : 0.0f;
+            float d32_safe = (d32 > bounds.sq_slack_p) ? (d32 - bounds.sq_slack_p) : 0.0f;
+            float lb64_s2 = bounds.scale_safe * (d32_safe + lb_t32 * lb_t32);
             if (lb64_s2 > heap.threshold_sq) {
                 report.pruned_by_pca_32d++;
-                record_pruned_check(iv, static_cast<double>(lb64_s2), report.bound_violations_pca32);
+                record_pruned_check(iv,
+                                    static_cast<double>(lb64_s2),
+                                    report.strict_violations_pca32,
+                                    report.diag_margin_events_pca32,
+                                    report.diag_exceed_violations_pca32);
                 continue;
             }
 

@@ -2,6 +2,7 @@
 #include "../include/dataset_loader.h"
 #include "../include/physical_layouts.h"
 #include "../include/execution_plans.h"
+#include "../include/ieee754_bounds.h"
 
 #include <iostream>
 #include <fstream>
@@ -10,19 +11,57 @@
 #include <algorithm>
 #include <iomanip>
 #include <cmath>
+#include <sstream>
 
 using namespace alg_flat;
 
+#ifdef _WIN32
+typedef LONG (WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+static std::string query_exact_windows_version() {
+    HMODULE hMod = GetModuleHandleW(L"ntdll.dll");
+    if (hMod) {
+        RtlGetVersionPtr fxPtr = reinterpret_cast<RtlGetVersionPtr>(
+            GetProcAddress(hMod, "RtlGetVersion")
+        );
+        if (fxPtr != nullptr) {
+            RTL_OSVERSIONINFOW rovi = {0};
+            rovi.dwOSVersionInfoSize = sizeof(rovi);
+            if (fxPtr(&rovi) == 0) {
+                std::ostringstream oss;
+                const char* win_name = (rovi.dwBuildNumber >= 22000) ? "Windows 11" : "Windows 10";
+                oss << win_name << " x86_64 (NT " << rovi.dwMajorVersion << "."
+                    << rovi.dwMinorVersion << " Build " << rovi.dwBuildNumber << ")";
+                return oss.str();
+            }
+        }
+    }
+    return "Windows x86_64";
+}
+#else
+static std::string query_exact_windows_version() {
+    return "POSIX x86_64";
+}
+#endif
+
 /*
- * Recall estricto por ID (Hito 2A Nivel 1: sin tolerancia de distancia en la frontera).
+ * Nivel 1A: IDSetRecall@K (sin tolerancia de distancia en la frontera y con rechazo
+ * explicito de IDs duplicados en la salida predicha).
  */
-static double compute_strict_id_recall_k(const Neighbor* pred, uint32_t pred_cnt,
-                                         const Neighbor* gt, uint32_t gt_cnt, uint32_t k) {
+static double compute_id_set_recall_k(const Neighbor* pred, uint32_t pred_cnt,
+                                      const Neighbor* gt, uint32_t gt_cnt, uint32_t k) {
     uint32_t target = (gt_cnt < k) ? gt_cnt : k;
     if (target == 0) return 1.0;
     uint32_t n_p = (pred_cnt < k) ? pred_cnt : k;
     uint32_t hits = 0;
     for (uint32_t i = 0; i < n_p; ++i) {
+        bool is_dup = false;
+        for (uint32_t prev = 0; prev < i; ++prev) {
+            if (pred[prev].id == pred[i].id) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (is_dup) continue;
         for (uint32_t j = 0; j < target; ++j) {
             if (pred[i].id == gt[j].id) {
                 hits++;
@@ -33,27 +72,47 @@ static double compute_strict_id_recall_k(const Neighbor* pred, uint32_t pred_cnt
     return static_cast<double>(hits) / static_cast<double>(target);
 }
 
+/*
+ * Nivel 1B: RankMatch@K (identidad exacta posicion a posicion pred[r].id == gt[r].id
+ * bajo el orden total determinista dist_sq_orig ASC, id ASC).
+ */
+static double compute_rank_match_k(const Neighbor* pred, uint32_t pred_cnt,
+                                   const Neighbor* gt, uint32_t gt_cnt, uint32_t k) {
+    uint32_t target = (gt_cnt < k) ? gt_cnt : k;
+    if (target == 0) return 1.0;
+    uint32_t matches = 0;
+    for (uint32_t r = 0; r < target; ++r) {
+        if (r < pred_cnt && pred[r].id == gt[r].id) {
+            matches++;
+        }
+    }
+    return static_cast<double>(matches) / static_cast<double>(target);
+}
+
 int main() {
 #ifdef _WIN32
     SetProcessAffinityMask(GetCurrentProcess(), 1ULL);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 #endif
 
+    std::string os_version_str = query_exact_windows_version();
+
     std::cout << "========================================================================================\n";
-    std::cout << "ALG-Flat 2.0 (Hito 1 + Certificacion Hito 2A): Benchmark Canonico de Ablacion\n";
+    std::cout << "ALG-Flat 2.0 (Hito 1 + Certificacion Hito 2A.1): Benchmark Canonico de Ablacion\n";
+    std::cout << "OS         : " << os_version_str << "\n";
     std::cout << "CPU Pinning: P-Core 0 (AffinityMask=0x1, HIGH_PRIORITY_CLASS)\n";
     std::cout << "Compilador : " << __VERSION__ << " | Flags: -O3 -march=native -mavx2 -mfma -std=c++17\n";
-    std::cout << "Corpus     : N=100,000 | Dim=64 (float32 = 25.6 MB) | Strict ID Recall (0 tolerancia)\n";
+    std::cout << "Corpus     : N=100,000 | Dim=64 (float32 = 25.6 MB) | IDSetRecall + RankMatch (0 tol)\n";
     std::cout << "========================================================================================\n";
 
     /* Guardar metadatos canonicos de reproduccion */
     {
         std::ofstream meta("results/run_metadata.txt");
-        meta << "Project: ALG-Flat 2.0 (Hito 1 + Hito 2A Exactness Audit)\n";
+        meta << "Project: ALG-Flat 2.0 (Hito 1 + Hito 2A.1 Formal IEEE-754 Exactness Audit)\n";
         meta << "Compiler: " << __VERSION__ << "\n";
         meta << "Compile_Flags: -O3 -march=native -mavx2 -mfma -std=c++17\n";
         meta << "CPU: Intel Core i5-13500 (24 MB Intel Smart Cache L3)\n";
-        meta << "OS: Windows 10/11 x86_64\n";
+        meta << "OS: " << os_version_str << "\n";
         meta << "Affinity_Mask: 0x1 (P-Core 0)\n";
         meta << "Process_Priority: HIGH_PRIORITY_CLASS\n";
         meta << "Corpus_Vectors: 100000\n";
@@ -62,7 +121,9 @@ int main() {
         meta << "Warm_Queries: 500 (after 20 warmup queries per plan)\n";
         meta << "Cold_Queries: 40 (with 36 MB LLC eviction buffer + _mm_mfence before each query)\n";
         meta << "Plan_Execution_Order: 0_Ref_Hito9 -> 1_Scalar -> 2A_AVX2_1x -> 2B_AVX2_4x -> 3A_SoA -> 3B_AoSoA -> 4_IVF_Flat -> 5A_IVF_PartPrune -> 5B_IVF_FullExactPrune\n";
-        meta << "Recall_Metric: Strict ID Recall (exact ID set membership, tie-break dist_sq ASC, id ASC, 0 distance tolerance)\n";
+        meta << "IEEE754_Unit_Roundoff_u: 5.9604644775390625e-8 (2^-24)\n";
+        meta << "IEEE754_Gamma_Constants: gamma_16=" << GAMMA_16_F32 << ", gamma_64=" << GAMMA_64_F32 << ", gamma_66=" << GAMMA_66_F32 << "\n";
+        meta << "Recall_Metrics: IDSetRecall (duplicate-checked exact ID set membership, 0 distance tolerance) + RankMatch (position-by-position identity under dist_sq ASC, id ASC)\n";
     }
 
     struct ScenarioConfig {
@@ -84,7 +145,7 @@ int main() {
     std::ofstream csv("results/ablation_hito1_summary.csv");
     csv << "Scenario,CacheMode,TopK,SelectivityPct,Plan,BuildTime_ms,PrepMean_us,CalcMean_us,"
         << "TotalMean_us,p50_us,p95_us,p99_us,MeanCycles,CyclesPerEligibleVec,DistsEvaluated,"
-        << "VectorsPrunedPct,PartitionsVisitedPct,EffectiveBW_GBs,StrictRecall10,StrictRecallK\n";
+        << "VectorsPrunedPct,PartitionsVisitedPct,EffectiveBW_GBs,IDSetRecall10,IDSetRecallK,RankMatch10,RankMatchK\n";
 
     for (const auto& sc : scenarios) {
         std::cout << "\n########################################################################################\n";
@@ -138,10 +199,10 @@ int main() {
 
             printf("\n--- [%s | %s | Sel=%.1f%% (%u elegibles) | Top-%u | Queries=%u] ---\n",
                    sc.name.c_str(), cmode.c_str(), sel_pct, pred.eligible_count, k, nq);
-            printf("%-30s | %8s | %8s | %8s | %8s | %8s | %7s | %7s | %7s | %8s\n",
+            printf("%-30s | %8s | %8s | %8s | %8s | %8s | %7s | %7s | %7s | %8s | %8s\n",
                    "Plan de Ejecucion", "Prep(us)", "Calc(us)", "p50(us)", "p95(us)", "Mean(us)",
-                   "Cyc/Vec", "Pruned%", "BW(GBs)", "StrictR%");
-            printf("------------------------------------------------------------------------------------------------------------------------------\n");
+                   "Cyc/Vec", "Pruned%", "BW(GBs)", "IDSetR%", "RankM%");
+            printf("-----------------------------------------------------------------------------------------------------------------------------------------\n");
 
             /* Precalcular Ground Truth Exacto en espacio original con Plan 0 */
             std::vector<std::vector<Neighbor>> gt_all(nq, std::vector<Neighbor>(k));
@@ -198,7 +259,7 @@ int main() {
                 std::vector<double> tot_lats(nq);
                 double sum_prep = 0.0, sum_calc = 0.0, sum_tot = 0.0;
                 double sum_cycles = 0.0, sum_dists = 0.0, sum_parts_pct = 0.0;
-                double sum_bytes = 0.0, sum_r10 = 0.0, sum_rk = 0.0;
+                double sum_bytes = 0.0, sum_r10 = 0.0, sum_rk = 0.0, sum_rm10 = 0.0, sum_rmk = 0.0;
 
                 Neighbor q_out[512];
                 uint32_t q_cnt = 0;
@@ -229,8 +290,10 @@ int main() {
                     sum_parts_pct += 100.0 * static_cast<double>(m.partitions_visited) / static_cast<double>(m.partitions_total);
                     sum_bytes += static_cast<double>(m.bytes_read);
 
-                    sum_r10 += compute_strict_id_recall_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], 10);
-                    sum_rk += compute_strict_id_recall_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], k);
+                    sum_r10 += compute_id_set_recall_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], 10);
+                    sum_rk  += compute_id_set_recall_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], k);
+                    sum_rm10 += compute_rank_match_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], 10);
+                    sum_rmk  += compute_rank_match_k(q_out, q_cnt, gt_all[q].data(), gt_cnts[q], k);
                 }
 
                 std::sort(tot_lats.begin(), tot_lats.end());
@@ -249,11 +312,13 @@ int main() {
                 double mean_parts_pct = sum_parts_pct / nq;
                 double bw_gbs = (sum_bytes / nq) / (mean_tot * 1e-6) / 1e9;
                 double r10 = (sum_r10 / nq) * 100.0;
-                double rk = (sum_rk / nq) * 100.0;
+                double rk  = (sum_rk / nq) * 100.0;
+                double rm10 = (sum_rm10 / nq) * 100.0;
+                double rmk  = (sum_rmk / nq) * 100.0;
 
-                printf("%-30s | %8.1f | %8.1f | %8.1f | %8.1f | %8.1f | %7.1f | %6.1f%% | %7.2f | %7.3f%%\n",
+                printf("%-30s | %8.1f | %8.1f | %8.1f | %8.1f | %8.1f | %7.1f | %6.1f%% | %7.2f | %7.3f%% | %7.3f%%\n",
                        plan_names[pid], mean_prep, mean_calc, p50, p95, mean_tot,
-                       cyc_per_vec, pruned_pct, bw_gbs, rk);
+                       cyc_per_vec, pruned_pct, bw_gbs, rk, rmk);
 
                 csv << sc.name << "," << cmode << "," << k << "," << sel_pct << ","
                     << plan_names[pid] << "," << build_times[pid] << ","
@@ -261,7 +326,7 @@ int main() {
                     << p50 << "," << p95 << "," << p99 << ","
                     << mean_cyc << "," << cyc_per_vec << "," << mean_dists << ","
                     << pruned_pct << "," << mean_parts_pct << "," << bw_gbs << ","
-                    << r10 << "," << rk << "\n";
+                    << r10 << "," << rk << "," << rm10 << "," << rmk << "\n";
             }
         }
     }

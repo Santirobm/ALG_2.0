@@ -137,25 +137,27 @@ static void compute_pca_ortho_basis(const float* sample_vecs,
     out_ortho_defect = std::nextafterf(static_cast<float>(std::sqrt(frob_sq)), INFINITY);
 }
 
-/* Rota el residuo (in_v - ref_v) por Q^T usando el mismo acumulador AVX2 que en tiempo de consulta */
+/*
+ * Rota el residuo (in_v - ref_v) por Q^T acumulando en IEEE-754 binary64 (double)
+ * y redondeando una sola vez a float32, garantizando:
+ *   ||out_v - Q^T(in_v - ref_v)||_2 <= 2 * u * ||in_v - ref_v||_2
+ */
 static inline void rotate_residual_64(const float* qt,
                                       const float* in_v,
                                       const float* ref_v,
                                       float* out_v,
                                       uint32_t dim) {
-    alignas(64) float diff[64];
+    double diff[64];
     for (uint32_t d = 0; d < dim; ++d) {
-        diff[d] = in_v[d] - ref_v[d];
+        diff[d] = static_cast<double>(in_v[d]) - static_cast<double>(ref_v[d]);
     }
     for (uint32_t r = 0; r < dim; ++r) {
         const float* row = qt + static_cast<size_t>(r) * dim;
-        __m256 acc0 = _mm256_setzero_ps();
-        __m256 acc1 = _mm256_setzero_ps();
-        for (uint32_t d = 0; d < dim; d += 16) {
-            acc0 = _mm256_fmadd_ps(_mm256_load_ps(row + d), _mm256_load_ps(diff + d), acc0);
-            acc1 = _mm256_fmadd_ps(_mm256_load_ps(row + d + 8), _mm256_load_ps(diff + d + 8), acc1);
+        double acc = 0.0;
+        for (uint32_t d = 0; d < dim; ++d) {
+            acc += static_cast<double>(row[d]) * diff[d];
         }
-        out_v[r] = hsum256_ps_fast(_mm256_add_ps(acc0, acc1));
+        out_v[r] = static_cast<float>(acc);
     }
 }
 

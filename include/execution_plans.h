@@ -3,14 +3,18 @@
 
 #include "alg_flat_types.h"
 #include "physical_layouts.h"
+#include "ieee754_bounds.h"
 
 namespace alg_flat {
 
 /*
- * Reporte de Auditoria Matematica de Poda (Hito 2A - Nivel 3)
- * Verifica para cada vector descartado que su cota inferior conservadora LB^2(q, x)
- * sea <= la distancia real en espacio original d_orig^2(q, x), y que ningun
- * vecino del Top-K verdadero sea descartado en ninguna etapa.
+ * Reporte de Auditoria Matematica de Poda sin Tolerancia Oculta (Hito 2A.1 - Nivel 3)
+ * Para cada vector elegible descartado x, mide el exceso firmado:
+ *   Delta(q, x) = LB_safe^2(q, x) - d_orig^2(q, x)
+ * y separa explicitamente:
+ *   1. Violaciones estrictas (Delta > 0.0, tolerancia CERO).
+ *   2. Excesos numericos dentro del margen de diagnostico (0.0 < Delta <= eps_diag).
+ *   3. Violaciones que superan el umbral de diagnostico (Delta > eps_diag).
  */
 struct PruningAuditReport {
     uint64_t total_eligible_checked;
@@ -20,13 +24,29 @@ struct PruningAuditReport {
     uint64_t pruned_by_pca_32d;
     uint64_t evaluated_full_64d;
 
-    uint64_t bound_violations_partition;
-    uint64_t bound_violations_radial;
-    uint64_t bound_violations_pca16;
-    uint64_t bound_violations_pca32;
+    /* Categoria 1: Violaciones estrictas (Delta = LB_safe^2 - d_orig^2 > 0.0, sin tolerancia) */
+    uint64_t strict_violations_partition;
+    uint64_t strict_violations_radial;
+    uint64_t strict_violations_pca16;
+    uint64_t strict_violations_pca32;
+
+    /* Categoria 2: Excesos dentro del margen de diagnostico del auditor (0.0 < Delta <= eps_diag) */
+    uint64_t diag_margin_events_partition;
+    uint64_t diag_margin_events_radial;
+    uint64_t diag_margin_events_pca16;
+    uint64_t diag_margin_events_pca32;
+
+    /* Categoria 3: Violaciones superiores al umbral de diagnostico (Delta > eps_diag) */
+    uint64_t diag_exceed_violations_partition;
+    uint64_t diag_exceed_violations_radial;
+    uint64_t diag_exceed_violations_pca16;
+    uint64_t diag_exceed_violations_pca32;
+
     uint64_t false_prunings_topk;
 
-    double min_ratio_orig_over_lb; /* Debe ser >= 1.000000 en todo vector podado */
+    double max_signed_excess;       /* max_{podados} (LB_safe^2 - d_orig^2); debe ser <= 0.0 */
+    double max_positive_excess;     /* max(0.0, max_signed_excess); debe ser == 0.0 */
+    double min_ratio_orig_over_lb;  /* min_{podados} (d_orig^2 / LB_safe^2); debe ser >= 1.000000 */
 };
 
 /*
@@ -135,7 +155,7 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
                                               QueryExecutionMetrics& metrics);
 
 /*
- * Auditoria de Exactitud Nivel 3: Verifica matematicamente cada descarte de 5B contra la distancia original exacta
+ * Auditoria de Exactitud Nivel 3 (Hito 2A.1): Verifica sin tolerancia oculta cada descarte de 5B
  */
 void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                                     const float* q,

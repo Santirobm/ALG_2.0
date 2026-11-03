@@ -52,6 +52,7 @@ struct PruningAuditReport {
     double max_signed_excess;       /* max_{podados} (LB_safe^2 - d_orig^2); debe ser <= 0.0 */
     double max_positive_excess;     /* max(0.0, max_signed_excess); debe ser == 0.0 */
     double min_ratio_orig_over_lb;  /* min_{podados} (d_orig^2 / LB_safe^2); debe ser >= 1.000000 */
+    uint64_t contract_fallbacks;    /* Consultas que cayeron a ExactScan por violacion de MXCSR o dominio */
 };
 
 /*

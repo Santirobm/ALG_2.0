@@ -96,25 +96,31 @@ int main() {
 #endif
 
     std::string os_version_str = query_exact_windows_version();
+    uint32_t raw_csr = 0;
+    bool csr_ok = check_ieee754_mxcsr_state(&raw_csr);
 
     std::cout << "========================================================================================\n";
-    std::cout << "ALG-Flat 2.0 (Hito 1 + Certificacion Hito 2A.2): Benchmark Canonico de Ablacion\n";
+    std::cout << "ALG-Flat 2.0 (Hito 1 + Certificacion Hito 2A.3): Benchmark Canonico de Ablacion\n";
     std::cout << "OS         : " << os_version_str << "\n";
     std::cout << "CPU Pinning: P-Core 0 (AffinityMask=0x1, HIGH_PRIORITY_CLASS)\n";
     std::cout << "Compilador : " << __VERSION__ << " | Flags: -O3 -march=native -mavx2 -mfma -std=c++17\n";
+    std::cout << "MXCSR      : 0x" << std::hex << raw_csr << std::dec << " (Contract_Valid=" << (csr_ok ? "YES" : "NO")
+              << ", MaxCoordAbs=" << CERTIFIED_MAX_COORD_ABS << ")\n";
     std::cout << "Corpus     : N=100,000 | Dim=64 (float32 = 25.6 MB) | IDSetRecall + RankMatch (0 tol)\n";
     std::cout << "========================================================================================\n";
 
     /* Guardar metadatos canonicos de reproduccion */
     {
         std::ofstream meta("results/run_metadata.txt");
-        meta << "Project: ALG-Flat 2.0 (Hito 1 + Hito 2A.2 Formal 5-Stage IEEE-754 Exactness Audit with Directed Rounding)\n";
+        meta << "Project: ALG-Flat 2.0 (Hito 1 + Hito 2A.3 Formal IEEE-754 Contract, Outward Binary64 Intervals & Unified 5-Stage Kernel)\n";
         meta << "Compiler: " << __VERSION__ << "\n";
         meta << "Compile_Flags: -O3 -march=native -mavx2 -mfma -std=c++17\n";
         meta << "CPU: Intel Core i5-13500 (24 MB Intel Smart Cache L3)\n";
         meta << "OS: " << os_version_str << "\n";
         meta << "Affinity_Mask: 0x1 (P-Core 0)\n";
         meta << "Process_Priority: HIGH_PRIORITY_CLASS\n";
+        meta << "MXCSR_State_Hex: 0x" << std::hex << raw_csr << std::dec << " (RoundToNearestEven=0, FTZ=0, DAZ=0, Contract_Valid=" << (csr_ok ? "true" : "false") << ")\n";
+        meta << "Certified_Domain_MaxCoordAbs: " << CERTIFIED_MAX_COORD_ABS << " (finite float32, no overflow in 64D L2/PCA)\n";
         meta << "Corpus_Vectors: 100000\n";
         meta << "Dimension: 64 (float32, 25.6 MB raw corpus)\n";
         meta << "Seed: 8\n";
@@ -122,7 +128,7 @@ int main() {
         meta << "Cold_Queries: 40 (with 36 MB LLC eviction buffer + _mm_mfence before each query)\n";
         meta << "Plan_Execution_Order: 0_Ref_Hito9 -> 1_Scalar -> 2A_AVX2_1x -> 2B_AVX2_4x -> 3A_SoA -> 3B_AoSoA -> 4_IVF_Flat -> 5A_IVF_PartPrune -> 5B_IVF_FullExactPrune\n";
         meta << "IEEE754_Unit_Roundoff_u32: 5.9604644775390625e-8 (2^-24), u64: 1.1102230246251565e-16 (2^-53)\n";
-        meta << "IEEE754_Directed_Rounding: round_up_f32 (+infty via nextafterf) for slacks/upper bounds, round_down_f32 (0 via nextafterf) for scale_safe/lower bounds\n";
+        meta << "IEEE754_Directed_Rounding: Outward binary64 intervals (add_up_f64/mul_up_f64/div_up_f64/sub_down_f64) + round_up_f32/round_down_f32 via nextafterf\n";
         meta << "IEEE754_Gamma_Constants: gamma_17=" << GAMMA_17_F32 << ", gamma_33=" << GAMMA_33_F32
              << ", gamma_64=" << GAMMA_64_F32 << ", gamma_66=" << GAMMA_66_F32 << ", gamma_67=" << GAMMA_67_F32 << "\n";
         meta << "Recall_Metrics: IDSetRecall (duplicate-checked exact ID set membership, 0 distance tolerance) + RankMatch (position-by-position identity under dist_sq ASC, id ASC)\n";

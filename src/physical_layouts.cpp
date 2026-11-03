@@ -1,5 +1,6 @@
 #include "../include/physical_layouts.h"
 #include "../include/simd_kernels.h"
+#include "../include/ieee754_bounds.h"
 #include <chrono>
 #include <cmath>
 #include <algorithm>
@@ -131,10 +132,10 @@ static void compute_pca_ortho_basis(const float* sample_vecs,
                 dot += static_cast<double>(out_qt[k * dim + i]) * static_cast<double>(out_qt[k * dim + j]);
             }
             double err = dot - (i == j ? 1.0 : 0.0);
-            frob_sq += err * err;
+            frob_sq = add_up_f64(frob_sq, mul_up_f64(std::fabs(err), std::fabs(err)));
         }
     }
-    out_ortho_defect = std::nextafterf(static_cast<float>(std::sqrt(frob_sq)), INFINITY);
+    out_ortho_defect = round_up_f32(sqrt_up_f64(frob_sq));
 }
 
 /*
@@ -282,6 +283,9 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
     out_idx.num_vectors = nv;
     out_idx.dim = dim;
     out_idx.num_partitions = num_partitions;
+    out_idx.certified_Contract_valid = check_ieee754_mxcsr_state()
+                                    && (dim == 64U)
+                                    && check_vector_domain_certified(ds.vectors, static_cast<size_t>(nv) * dim);
 
     out_idx.ortho_basis = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(dim) * dim * sizeof(float)));
     out_idx.global_mean = static_cast<float*>(aligned_alloc_64(static_cast<size_t>(dim) * sizeof(float)));
@@ -380,10 +384,10 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
                            dim);
         double norm_sq = 0.0;
         for (uint32_t d = 0; d < dim; ++d) {
-            double diff = static_cast<double>(cent[d]) - static_cast<double>(out_idx.global_mean[d]);
-            norm_sq += diff * diff;
+            double diff = std::fabs(static_cast<double>(cent[d]) - static_cast<double>(out_idx.global_mean[d]));
+            norm_sq = add_up_f64(norm_sq, mul_up_f64(diff, diff));
         }
-        out_idx.centroid_mean_norms[c] = std::nextafterf(static_cast<float>(std::sqrt(norm_sq)), INFINITY);
+        out_idx.centroid_mean_norms[c] = round_up_f32(sqrt_up_f64(norm_sq));
     }
 
     auto t_kmeans = std::chrono::high_resolution_clock::now();
@@ -455,10 +459,8 @@ void build_ivf_partitioned_index(const BenchmarkDataset& ds,
 
         if (cnt > 0) {
             /* Redondeo conservador IEEE-754: min_radius hacia 0, max_radius hacia +inf */
-            float r_min_f = static_cast<float>(bucket.front().radius_exact);
-            float r_max_f = static_cast<float>(bucket.back().radius_exact);
-            gp.min_radius = (r_min_f > 0.0f) ? std::nextafterf(r_min_f, 0.0f) : 0.0f;
-            gp.max_radius = std::nextafterf(r_max_f, INFINITY);
+            gp.min_radius = round_down_f32(bucket.front().radius_exact);
+            gp.max_radius = round_up_f32(bucket.back().radius_exact);
         } else {
             gp.min_radius = 0.0f;
             gp.max_radius = 0.0f;

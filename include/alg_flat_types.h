@@ -129,6 +129,7 @@ struct QueryExecutionMetrics {
     uint32_t partitions_visited;
     uint32_t partitions_total;
     uint64_t bytes_read;
+    uint32_t fallback_triggered; /* 1 si MXCSR o el dominio de entrada violaron el contrato IEEE-754 y forzaron ExactScan */
 };
 
 /*

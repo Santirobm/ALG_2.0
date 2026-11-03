@@ -12,60 +12,206 @@
 using namespace alg_flat;
 
 /*
- * Verificacion unitaria de las invariantes de redondeo dirigido en IEEE-754 (Hito 2A.2):
- * Comprueba que para cualquier rango de normas y radios:
- *   - delta_vec_p, fp_slack_p, sq_slack_{16,32,64}_p son estrictamente mayores o iguales
- *     que sus valores matematicos en precision doble (redondeo hacia +infinito).
- *   - scale_safe_{16,32,64} son estrictamente menores o iguales que sus factores matematicos
- *     en precision doble (redondeo hacia 0).
+ * ============================================================================
+ * ORACULO DE PRECISION EXTENDIDA Y CONTRATO DE EJECUCION IEEE-754 (HITO 2A.3)
+ * ============================================================================
+ * 1. Verifica que las primitivas de intervalos en binary64 (add_up_f64, mul_up_f64,
+ *    div_up_f64, sqrt_up_f64, sub_down_f64, mul_down_f64, div_down_f64, sqrt_down_f64)
+ *    y las funciones compute_partition_certified_bounds / compute_partition_distance_bounds /
+ *    compute_radial_shell_interval envuelvan de forma conservadora al oraculo en `long double`
+ *    a lo largo de 12 ordenes de magnitud (1e-6 a 1e14) y casos de borde (0.0, 1 ULP, asimetria).
+ * 2. Verifica en tiempo de ejecucion el contrato MXCSR y el dominio de coordenadas:
+ *    - Si se activa FTZ (0x8000), DAZ (0x0040) o un modo de redondeo distinto de Nearest-Even,
+ *      `check_ieee754_mxcsr_state()` lo detecta y tanto Plan 5A como Plan 5B desactivan
+ *      inmediatamente las podas y conmutan a ExactScan (`metrics.fallback_triggered == 1`),
+ *      preservando 100.0000% IDSetRecall y RankMatch.
+ *    - Si una consulta contiene una coordenada fuera de CERTIFIED_MAX_COORD_ABS (> 1.0e15f)
+ *      o no finita (`INFINITY` / `NaN`), `check_vector_domain_certified()` rechaza la poda
+ *      certificada y activa el fallback a ExactScan.
  */
-static void verify_directed_rounding_invariants() {
-    const double scales[6] = {1e-2, 0.25, 1.0, 15.0, 500.0, 25000.0};
-    for (int i = 0; i < 6; ++i) {
-        float q_norm = static_cast<float>(scales[i] * 1.37);
-        float c_norm = static_cast<float>(scales[i] * 0.91);
-        float dc_hi  = static_cast<float>(scales[i] * 0.63);
-        float r_max  = static_cast<float>(scales[i] * 0.42);
-        float def    = 2.95e-7f;
+static void verify_directed_rounding_and_interval_oracle() {
+    assert(check_ieee754_mxcsr_state() &&
+           "El estado MXCSR inicial del proceso debe cumplir Round-to-Nearest-Even, FTZ=0, DAZ=0!");
 
-        PartitionCertifiedBounds b = compute_partition_certified_bounds(q_norm, c_norm, dc_hi, r_max, def);
+    const double scales[10] = {
+        1.0e-6, 1.0e-4, 1.0e-2, 0.25, 1.0, 15.0, 500.0, 25000.0, 1.0e9, 1.0e13
+    };
+    const double ratios[4][4] = {
+        {1.37, 0.91, 0.63, 0.42},
+        {1.0,  1.0e-5, 1.0, 1.0e-5}, /* Alta asimetria entre escalas */
+        {1.0e-5, 1.0, 1.0e-5, 1.0},  /* Asimetria inversa */
+        {0.0,  0.0,  1.0, 1.0}       /* Casos con norma cero */
+    };
 
-        double delta_vec_exact = ROT64_L2_COEFF_Q_F64 * static_cast<double>(q_norm)
-                               + ROT64_L2_COEFF_C_F64 * static_cast<double>(c_norm)
-                               + ROT64_L2_COEFF_X_F64 * static_cast<double>(r_max);
-        assert(static_cast<double>(b.delta_vec_p) >= delta_vec_exact &&
-               "Redondeo dirigido fallo: delta_vec_p debe ser >= delta_vec_exact!");
+    const long double u32_ld = 5.9604644775390625e-8L;
+    auto gamma_ld = [&](uint32_t n) -> long double {
+        long double nu = static_cast<long double>(n) * u32_ld;
+        return nu / (1.0L - nu);
+    };
 
-        double dv = static_cast<double>(b.delta_vec_p);
-        double tail_err_exact = ieee754_gamma(64) * (static_cast<double>(dc_hi) + dv)
-                              + IEEE754_F32_U * static_cast<double>(r_max);
-        double fp_slack_exact = (1.0 + 4.0 * IEEE754_F32_U) * (dv + tail_err_exact);
-        assert(static_cast<double>(b.fp_slack_p) >= fp_slack_exact &&
-               "Redondeo dirigido fallo: fp_slack_p debe ser >= fp_slack_exact!");
+    const long double g17_ld = gamma_ld(17);
+    const long double g33_ld = gamma_ld(33);
+    const long double g64_ld = gamma_ld(64);
+    const long double g66_ld = gamma_ld(66);
+    const long double g67_ld = gamma_ld(67);
 
-        double max_vec_norm = std::sqrt(1.0 + static_cast<double>(def))
-                            * (static_cast<double>(dc_hi) + static_cast<double>(r_max)) + dv;
-        double base_sq_exact = 2.0 * dv * max_vec_norm;
-        assert(static_cast<double>(b.sq_slack_16_p) >= base_sq_exact * (1.0 + ieee754_gamma(17)) &&
-               "Redondeo dirigido fallo: sq_slack_16_p debe ser >= cota exacta 16D!");
-        assert(static_cast<double>(b.sq_slack_32_p) >= base_sq_exact * (1.0 + ieee754_gamma(33)) &&
-               "Redondeo dirigido fallo: sq_slack_32_p debe ser >= cota exacta 32D!");
-        assert(static_cast<double>(b.sq_slack_64_p) >= base_sq_exact * (1.0 + ieee754_gamma(67)) &&
-               "Redondeo dirigido fallo: sq_slack_64_p debe ser >= cota exacta 64D!");
+    const long double coeff_q_ld = 8.0L * g64_ld * (1.0L + u32_ld) + 4.0L * u32_ld;
+    const long double coeff_c_ld = 4.0L * u32_ld;
+    const long double coeff_x_ld = 2.0L * u32_ld;
 
-        double common_num = (1.0 - ieee754_gamma(66)) * (1.0 - 6.0 * IEEE754_F32_U);
-        double den = 1.0 + static_cast<double>(def);
-        assert(static_cast<double>(b.scale_safe_16) <= (common_num * (1.0 - ieee754_gamma(17))) / den &&
-               "Redondeo dirigido fallo: scale_safe_16 debe ser <= factor exacto 16D!");
-        assert(static_cast<double>(b.scale_safe_32) <= (common_num * (1.0 - ieee754_gamma(33))) / den &&
-               "Redondeo dirigido fallo: scale_safe_32 debe ser <= factor exacto 32D!");
-        assert(static_cast<double>(b.scale_safe_64) <= (common_num * (1.0 - ieee754_gamma(67))) / den &&
-               "Redondeo dirigido fallo: scale_safe_64 debe ser <= factor exacto 64D!");
-        assert(b.sq_slack_16_p <= b.sq_slack_32_p && b.sq_slack_32_p <= b.sq_slack_64_p &&
-               "Monotonia de holgura cuadratica por etapa (16D <= 32D <= 64D) violada!");
-        assert(b.scale_safe_16 >= b.scale_safe_32 && b.scale_safe_32 >= b.scale_safe_64 &&
-               "Monotonia de factor de escala por etapa (16D >= 32D >= 64D) violada!");
+    for (int s = 0; s < 10; ++s) {
+        for (int r = 0; r < 4; ++r) {
+            float q_norm = static_cast<float>(scales[s] * ratios[r][0]);
+            float c_norm = static_cast<float>(scales[s] * ratios[r][1]);
+            float dc_hi  = static_cast<float>(scales[s] * ratios[r][2]);
+            float r_max  = static_cast<float>(scales[s] * ratios[r][3]);
+            /* Probar tambien con perturbacion de 1 ULP */
+            if ((s + r) % 2 == 1 && q_norm > 0.0f) {
+                q_norm = std::nextafterf(q_norm, INFINITY);
+            }
+            float def = 2.95e-7f;
+
+            PartitionCertifiedBounds b = compute_partition_certified_bounds(q_norm, c_norm, dc_hi, r_max, def);
+
+            long double q_ld   = static_cast<long double>(q_norm);
+            long double c_ld   = static_cast<long double>(c_norm);
+            long double dc_ld  = static_cast<long double>(dc_hi);
+            long double rm_ld  = static_cast<long double>(r_max);
+            long double def_ld = static_cast<long double>(def);
+
+            long double delta_vec_oracle = coeff_q_ld * q_ld + coeff_c_ld * c_ld + coeff_x_ld * rm_ld;
+            assert(static_cast<long double>(b.delta_vec_p) >= delta_vec_oracle &&
+                   "Oraculo fallo: delta_vec_p debe ser >= delta_vec_oracle!");
+
+            long double dv_ld = static_cast<long double>(b.delta_vec_p);
+            long double tail_err_oracle = g64_ld * (dc_ld + dv_ld) + u32_ld * rm_ld;
+            long double fp_slack_oracle = (1.0L + 4.0L * u32_ld) * (dv_ld + tail_err_oracle);
+            assert(static_cast<long double>(b.fp_slack_p) >= fp_slack_oracle &&
+                   "Oraculo fallo: fp_slack_p debe ser >= fp_slack_oracle!");
+
+            long double max_vec_oracle = std::sqrt(1.0L + def_ld) * (dc_ld + rm_ld) + dv_ld;
+            long double base_sq_oracle = 2.0L * dv_ld * max_vec_oracle;
+            assert(static_cast<long double>(b.sq_slack_16_p) >= base_sq_oracle * (1.0L + g17_ld) &&
+                   "Oraculo fallo: sq_slack_16_p debe ser >= cota exacta 16D!");
+            assert(static_cast<long double>(b.sq_slack_32_p) >= base_sq_oracle * (1.0L + g33_ld) &&
+                   "Oraculo fallo: sq_slack_32_p debe ser >= cota exacta 32D!");
+            assert(static_cast<long double>(b.sq_slack_64_p) >= base_sq_oracle * (1.0L + g67_ld) &&
+                   "Oraculo fallo: sq_slack_64_p debe ser >= cota exacta 64D!");
+
+            long double common_num_ld = (1.0L - g66_ld) * (1.0L - 6.0L * u32_ld);
+            long double den_ld = 1.0L + def_ld;
+            assert(static_cast<long double>(b.scale_safe_16) <= (common_num_ld * (1.0L - g17_ld)) / den_ld &&
+                   "Oraculo fallo: scale_safe_16 debe ser <= factor exacto 16D!");
+            assert(static_cast<long double>(b.scale_safe_32) <= (common_num_ld * (1.0L - g33_ld)) / den_ld &&
+                   "Oraculo fallo: scale_safe_32 debe ser <= factor exacto 32D!");
+            assert(static_cast<long double>(b.scale_safe_64) <= (common_num_ld * (1.0L - g67_ld)) / den_ld &&
+                   "Oraculo fallo: scale_safe_64 debe ser <= factor exacto 64D!");
+
+            assert(b.sq_slack_16_p <= b.sq_slack_32_p && b.sq_slack_32_p <= b.sq_slack_64_p &&
+                   "Monotonia de holgura cuadratica por etapa (16D <= 32D <= 64D) violada!");
+            assert(b.scale_safe_16 >= b.scale_safe_32 && b.scale_safe_32 >= b.scale_safe_64 &&
+                   "Monotonia de factor de escala por etapa (16D >= 32D >= 64D) violada!");
+
+            /* Verificar tambien compute_partition_distance_bounds y compute_radial_shell_interval */
+            float d2_f32 = dc_hi * dc_hi;
+            float r_min  = r_max * 0.25f;
+            PartitionDistanceBounds pdb = compute_partition_distance_bounds(d2_f32, r_min, r_max);
+            long double d2_ld = static_cast<long double>(d2_f32);
+            long double dc_true_low  = std::sqrt(d2_ld * (1.0L - g66_ld));
+            long double dc_true_high = std::sqrt(d2_ld / (1.0L - g66_ld));
+            assert(static_cast<long double>(pdb.dc_low) <= dc_true_low &&
+                   "Oraculo fallo: dc_low debe ser <= dc_true_low!");
+            assert(static_cast<long double>(pdb.dc_high) >= dc_true_high &&
+                   "Oraculo fallo: dc_high debe ser >= dc_true_high!");
+
+            float r_low = 0.0f, r_high = 0.0f, r_pad = 0.0f;
+            float thresh_sq = (r_max * 0.5f) * (r_max * 0.5f);
+            compute_radial_shell_interval(pdb.dc_low, pdb.dc_high, r_max, thresh_sq, r_low, r_high, r_pad);
+            long double rho_oracle = std::sqrt(static_cast<long double>(thresh_sq) / (1.0L - g66_ld));
+            long double r_pad_oracle = u32_ld * rm_ld;
+            assert(static_cast<long double>(r_pad) >= r_pad_oracle &&
+                   "Oraculo fallo: r_pad debe ser >= r_pad_oracle!");
+            long double r_low_oracle = std::max(0.0L, static_cast<long double>(pdb.dc_low) - rho_oracle - static_cast<long double>(r_pad));
+            long double r_high_oracle = static_cast<long double>(pdb.dc_high) + rho_oracle + static_cast<long double>(r_pad);
+            assert(static_cast<long double>(r_low) <= r_low_oracle &&
+                   "Oraculo fallo: r_low debe ser <= r_low_oracle!");
+            assert(static_cast<long double>(r_high) >= r_high_oracle &&
+                   "Oraculo fallo: r_high debe ser >= r_high_oracle!");
+        }
     }
+}
+
+/*
+ * Verifica que cuando el contrato de entorno IEEE-754 se viola en tiempo de ejecucion
+ * (p. ej. otro componente activa FTZ/DAZ o cambia el modo de redondeo en MXCSR, o una
+ * consulta trae coordenadas fuera de rango / no finitas), los Planes 5A y 5B lo detectan
+ * y conmutan de inmediato al fallback seguro ExactScan sin perder exactitud.
+ */
+static void verify_runtime_environment_and_domain_contract() {
+    BenchmarkDataset ds;
+    generate_dataset_deterministic(42, 4096, 10, 16, 0.05f, MIX_R, ds);
+
+    FlatAoSIndex aos_idx;
+    IVFPartitionedIndex ivf_idx;
+    build_flat_aos_index(ds, aos_idx);
+    build_ivf_partitioned_index(ds, 16, 8, ivf_idx);
+    assert(ivf_idx.certified_Contract_valid && "El indice IVF base debe ser valido bajo contrato IEEE-754!");
+
+    const uint32_t sel_idx = 2;
+    const uint32_t target_cat = ds.header.selectivities_deci_percent[sel_idx] * 10U;
+    const auto& el_ids = ds.eligible_per_sel[sel_idx];
+    QueryPredicate pred{target_cat, el_ids.data(), static_cast<uint32_t>(el_ids.size()), sel_idx};
+
+    const uint32_t k = 50;
+    Neighbor gt[50], out5a[50], out5b[50];
+    uint32_t gt_cnt = 0, cnt5a = 0, cnt5b = 0;
+    QueryExecutionMetrics m_gt{}, m5a{}, m5b{};
+
+    const float* qv = ds.queries[0].values;
+    execute_plan0_ref_hito9(aos_idx, qv, pred, k, gt, &gt_cnt, m_gt);
+
+    /* Caso 1: Estado nominal MXCSR -> fallback_triggered == 0 */
+    execute_plan5a_ivf_part_prune_avx2(ivf_idx, qv, pred, k, out5a, &cnt5a, m5a);
+    execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, qv, pred, k, out5b, &cnt5b, m5b);
+    assert(m5a.fallback_triggered == 0U && m5b.fallback_triggered == 0U &&
+           "En estado MXCSR nominal no debe activarse el fallback!");
+
+    /* Caso 2: Simular que un proceso host activa FTZ (0x8000) o cambia el redondeo en MXCSR */
+    uint32_t saved_csr = _mm_getcsr();
+    _mm_setcsr(saved_csr | MXCSR_FTZ_BIT);
+    assert(!check_ieee754_mxcsr_state() && "check_ieee754_mxcsr_state() debe detectar FTZ=1!");
+
+    execute_plan5a_ivf_part_prune_avx2(ivf_idx, qv, pred, k, out5a, &cnt5a, m5a);
+    execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, qv, pred, k, out5b, &cnt5b, m5b);
+    _mm_setcsr(saved_csr); /* Restaurar inmediatamente */
+    assert(check_ieee754_mxcsr_state() && "MXCSR restaurado correctamente!");
+
+    assert(m5a.fallback_triggered == 1U && "Plan 5A debe activar fallback a ExactScan cuando FTZ=1!");
+    assert(m5b.fallback_triggered == 1U && "Plan 5B debe activar fallback a ExactScan cuando FTZ=1!");
+    assert(m5a.dists_evaluated == pred.eligible_count && m5b.dists_evaluated == pred.eligible_count &&
+           "En modo fallback deben evaluarse todos los vectores elegibles sin podar!");
+    for (uint32_t r = 0; r < k; ++r) {
+        assert(out5a[r].id == gt[r].id && out5b[r].id == gt[r].id &&
+               "El fallback por MXCSR debe preservar RankMatch@K = 100%!");
+    }
+
+    /* Caso 3: Simular consulta con coordenada fuera del dominio certificado (> 1.0e15f) */
+    alignas(64) float q_out_of_domain[64];
+    for (uint32_t d = 0; d < 64; ++d) q_out_of_domain[d] = qv[d];
+    q_out_of_domain[7] = 2.0e16f; /* Excede CERTIFIED_MAX_COORD_ABS (1.0e15f) */
+    assert(!check_vector_domain_certified(q_out_of_domain, 64) &&
+           "check_vector_domain_certified() debe rechazar |coord| > 1.0e15f!");
+
+    execute_plan5a_ivf_part_prune_avx2(ivf_idx, q_out_of_domain, pred, k, out5a, &cnt5a, m5a);
+    execute_plan5b_ivf_full_exact_prune_avx2(ivf_idx, q_out_of_domain, pred, k, out5b, &cnt5b, m5b);
+    assert(m5a.fallback_triggered == 1U && m5b.fallback_triggered == 1U &&
+           "Coordenadas fuera del rango certificado deben activar fallback a ExactScan!");
+
+    /* Caso 4: Simular coordenada no finita (NaN / Inf) */
+    q_out_of_domain[7] = INFINITY;
+    assert(!check_vector_domain_certified(q_out_of_domain, 64) &&
+           "check_vector_domain_certified() debe rechazar INFINITY!");
+    _mm_setcsr(saved_csr); /* Limpiar flags sticky de excepcion tras pruebas extremas */
 }
 
 /*
@@ -423,8 +569,10 @@ static void run_certification_suite(const char* suite_name,
     build_flat_soa_index(ds, soa_idx);
     build_flat_aosoa_index(ds, aosoa_idx);
     build_ivf_partitioned_index(ds, num_partitions, 12, ivf_idx);
+    assert(ivf_idx.certified_Contract_valid && "El indice IVF de la suite debe cumplir el contrato IEEE-754!");
 
-    printf("Defecto de ortogonalidad medido ||Q*Q^T - I||_F = %.3e\n", ivf_idx.ortho_defect);
+    printf("Defecto de ortogonalidad medido ||Q*Q^T - I||_F = %.3e | Contrato IEEE-754 = OK\n",
+           ivf_idx.ortho_defect);
 
     const uint32_t sel_idx = 2; /* 15.0% selectividad */
     const uint32_t target_cat = ds.header.selectivities_deci_percent[sel_idx] * 10U;
@@ -485,7 +633,7 @@ static void run_certification_suite(const char* suite_name,
                                               rank_matches_100[p], rank_totals_100[p], max_orig_dist_err[p]);
         }
 
-        /* Nivel 3: Auditar cada vector podado por Plan 5B en las 5 etapas (0 tolerancia) */
+        /* Nivel 3: Auditar cada vector podado por Plan 5B en las 5 etapas mediante el kernel unificado */
         audit_plan5b_pruning_soundness(ivf_idx, qv, pred, k, gt, gt_cnt, audit);
     }
 
@@ -517,11 +665,12 @@ static void run_certification_suite(const char* suite_name,
                           + audit.pruned_by_pca_64d;
     uint64_t total_accounted = total_pruned + audit.evaluated_full_64d;
 
-    printf("\n[Nivel 3 - Auditoria Exhaustiva de las 5 Etapas de Poda en 5B (Cero Tolerancia: LB_safe^2 <= d_orig^2)]\n");
-    printf("  Elegibles auditados            : %llu (Podados=%llu + EvaluadosOrig=%llu)\n",
+    printf("\n[Nivel 3 - Auditoria Unificada de las 5 Etapas de Poda en 5B (Cero Tolerancia: LB_safe^2 <= d_orig^2)]\n");
+    printf("  Elegibles auditados            : %llu (Podados=%llu + EvaluadosOrig=%llu | Fallbacks=%llu)\n",
            static_cast<unsigned long long>(audit.total_eligible_checked),
            static_cast<unsigned long long>(total_pruned),
-           static_cast<unsigned long long>(audit.evaluated_full_64d));
+           static_cast<unsigned long long>(audit.evaluated_full_64d),
+           static_cast<unsigned long long>(audit.contract_fallbacks));
     printf("  Podados por etapa              : Part=%llu | Radial=%llu | PCA16=%llu | PCA32=%llu | PCA64=%llu\n",
            static_cast<unsigned long long>(audit.pruned_by_partition),
            static_cast<unsigned long long>(audit.pruned_by_radial_shell),
@@ -551,6 +700,7 @@ static void run_certification_suite(const char* suite_name,
     printf("  Max exceso positivo            : %.6e (requerido == 0.000000e+00)\n", audit.max_positive_excess);
     printf("  Min ratio d_orig^2 / LB_safe^2 : %.6f (requerido >= 1.000000)\n", audit.min_ratio_orig_over_lb);
 
+    assert(audit.contract_fallbacks == 0 && "En las suites nominales no debe ocurrir ningun fallback por MXCSR/dominio!");
     assert(total_accounted == audit.total_eligible_checked &&
            "Contabilidad incompleta: Podados(5 etapas) + EvaluadosOrig debe igualar total_eligible_checked!");
     assert(audit.strict_violations_partition == 0 && "Violacion estricta (LB_safe^2 > d_orig^2) en poda de particion!");
@@ -571,16 +721,24 @@ static void run_certification_suite(const char* suite_name,
 
 int main() {
     std::cout << "================================================================================\n";
-    std::cout << "ALG-Flat 2.0 (Hito 2A.2): Certificacion Exhaustiva de las 5 Etapas de Poda\n";
-    std::cout << "  - Redondeo dirigido conservador (round_up_f32 / round_down_f32 con nextafterf)\n";
-    std::cout << "  - Profundidades de redondeo separadas por etapa (16D:g17, 32D:g33, 64D:g67)\n";
-    std::cout << "  - Auditoria bit a bit de las 5 etapas: Particion, Radial, PCA16, PCA32 y PCA64\n";
+    std::cout << "ALG-Flat 2.0 (Hito 2A.3): Contrato Formal de Entorno IEEE-754 y Kernel Unificado\n";
+    std::cout << "  - Validacion de MXCSR (Round-to-Nearest-Even, FTZ=0, DAZ=0) y dominio |x|<=1e15\n";
+    std::cout << "  - Aritmetica de intervalos en binary64 (redondeo hacia afuera) + Oraculo long double\n";
+    std::cout << "  - Kernel unificado templado (AuditMode=false/true) sin duplicacion produccion/auditor\n";
     std::cout << "  - Nivel 1A/1B: IDSetRecall (sin duplicados) + RankMatch posicion a posicion\n";
     std::cout << "  - Nivel 3    : Exceso con signo Delta = LB_safe^2 - d_orig^2 <= 0.0 (0 tol)\n";
     std::cout << "================================================================================\n";
 
-    verify_directed_rounding_invariants();
-    printf("[OK] Invariantes de redondeo dirigido verificadas (round_up_f32 >= exact, round_down_f32 <= exact)\n");
+    verify_directed_rounding_and_interval_oracle();
+    printf("[OK] Oraculo en long double + Aritmetica de Intervalos binary64 verificados (40 regimenes x 12 ordenes de magnitud)\n");
+
+    verify_runtime_environment_and_domain_contract();
+    printf("[OK] Contrato MXCSR (deteccion FTZ/DAZ) y dominio de coordenadas (|x| <= 1.0e15f) + Fallback a ExactScan verificados\n");
+
+    uint32_t raw_csr = 0;
+    check_ieee754_mxcsr_state(&raw_csr);
+    printf("Estado MXCSR activo: 0x%04X (Round=0, FTZ=0, DAZ=0) | MaxCoordAbs=%.1e\n",
+           raw_csr, static_cast<double>(CERTIFIED_MAX_COORD_ABS));
     printf("Constantes IEEE-754 derivadas (u_32 = 2^-24 = %.3e, u_64 = 2^-53 = %.3e):\n",
            IEEE754_F32_U, IEEE754_F64_U);
     printf("  gamma_17 = %.3e | gamma_33 = %.3e | gamma_64 = %.3e | gamma_66 = %.3e | gamma_67 = %.3e\n",
@@ -619,7 +777,7 @@ int main() {
     }
 
     std::cout << "\n================================================================================\n";
-    std::cout << "CERTIFICACION HITO 2A.2 SUPERADA: 5 ETAPAS AUDITADAS, 0 VIOLACIONES ESTRICTAS\n";
+    std::cout << "CERTIFICACION HITO 2A.3 SUPERADA: CONTRATO IEEE-754 + KERNEL UNIFICADO VALIDADOS\n";
     std::cout << "================================================================================\n";
     return 0;
 }

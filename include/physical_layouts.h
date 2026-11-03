@@ -112,6 +112,7 @@ struct IVFPartitionedIndex {
     double kmeans_time_ms;
     double layout_time_ms;
     double total_build_time_ms;
+    bool certified_Contract_valid;      /* true si MXCSR y todo el corpus cumplieron el contrato IEEE-754 en build-time */
 
     IVFPartitionedIndex()
         : num_vectors(0), dim(0), num_partitions(0),
@@ -120,7 +121,8 @@ struct IVFPartitionedIndex {
           part_orig_vectors(nullptr), part_aos_vectors(nullptr),
           part_aos_ids(nullptr), part_aos_categories(nullptr),
           part_aos_radii(nullptr), part_aos_tail48_norm(nullptr), part_aos_tail32_norm(nullptr),
-          kmeans_time_ms(0.0), layout_time_ms(0.0), total_build_time_ms(0.0) {}
+          kmeans_time_ms(0.0), layout_time_ms(0.0), total_build_time_ms(0.0),
+          certified_Contract_valid(false) {}
 
     ~IVFPartitionedIndex() {
         aligned_free_64(ortho_basis);

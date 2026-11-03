@@ -1,10 +1,12 @@
-Project: ALG-Flat 2.0 (Hito 1 + Hito 2A.2 Formal 5-Stage IEEE-754 Exactness Audit with Directed Rounding)
+Project: ALG-Flat 2.0 (Hito 1 + Hito 2A.3 Formal IEEE-754 Contract, Outward Binary64 Intervals & Unified 5-Stage Kernel)
 Compiler: Clang 22.1.8
 Compile_Flags: -O3 -march=native -mavx2 -mfma -std=c++17
 CPU: Intel Core i5-13500 (24 MB Intel Smart Cache L3)
 OS: Windows 10 x86_64 (NT 10.0 Build 19045)
 Affinity_Mask: 0x1 (P-Core 0)
 Process_Priority: HIGH_PRIORITY_CLASS
+MXCSR_State_Hex: 0x1f80 (RoundToNearestEven=0, FTZ=0, DAZ=0, Contract_Valid=true)
+Certified_Domain_MaxCoordAbs: 1e+15 (finite float32, no overflow in 64D L2/PCA)
 Corpus_Vectors: 100000
 Dimension: 64 (float32, 25.6 MB raw corpus)
 Seed: 8
@@ -12,6 +14,6 @@ Warm_Queries: 500 (after 20 warmup queries per plan)
 Cold_Queries: 40 (with 36 MB LLC eviction buffer + _mm_mfence before each query)
 Plan_Execution_Order: 0_Ref_Hito9 -> 1_Scalar -> 2A_AVX2_1x -> 2B_AVX2_4x -> 3A_SoA -> 3B_AoSoA -> 4_IVF_Flat -> 5A_IVF_PartPrune -> 5B_IVF_FullExactPrune
 IEEE754_Unit_Roundoff_u32: 5.9604644775390625e-8 (2^-24), u64: 1.1102230246251565e-16 (2^-53)
-IEEE754_Directed_Rounding: round_up_f32 (+infty via nextafterf) for slacks/upper bounds, round_down_f32 (0 via nextafterf) for scale_safe/lower bounds
+IEEE754_Directed_Rounding: Outward binary64 intervals (add_up_f64/mul_up_f64/div_up_f64/sub_down_f64) + round_up_f32/round_down_f32 via nextafterf
 IEEE754_Gamma_Constants: gamma_17=1.01328e-06, gamma_33=1.96696e-06, gamma_64=3.81471e-06, gamma_66=3.93392e-06, gamma_67=3.99353e-06
 Recall_Metrics: IDSetRecall (duplicate-checked exact ID set membership, 0 distance tolerance) + RankMatch (position-by-position identity under dist_sq ASC, id ASC)

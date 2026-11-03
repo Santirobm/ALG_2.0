@@ -8,8 +8,9 @@
 namespace alg_flat {
 
 /*
- * Reporte de Auditoria Matematica de Poda sin Tolerancia Oculta (Hito 2A.1 - Nivel 3)
- * Para cada vector elegible descartado x, mide el exceso firmado:
+ * Reporte de Auditoria Matematica de Poda sin Tolerancia Oculta (Hito 2A.2 - Nivel 3)
+ * Para cada vector elegible descartado x en cualquiera de las 5 etapas (Particion, Radial,
+ * PCA 16D, PCA 32D y PCA 64D), mide el exceso firmado exacto:
  *   Delta(q, x) = LB_safe^2(q, x) - d_orig^2(q, x)
  * y separa explicitamente:
  *   1. Violaciones estrictas (Delta > 0.0, tolerancia CERO).
@@ -22,6 +23,7 @@ struct PruningAuditReport {
     uint64_t pruned_by_radial_shell;
     uint64_t pruned_by_pca_16d;
     uint64_t pruned_by_pca_32d;
+    uint64_t pruned_by_pca_64d;
     uint64_t evaluated_full_64d;
 
     /* Categoria 1: Violaciones estrictas (Delta = LB_safe^2 - d_orig^2 > 0.0, sin tolerancia) */
@@ -29,18 +31,21 @@ struct PruningAuditReport {
     uint64_t strict_violations_radial;
     uint64_t strict_violations_pca16;
     uint64_t strict_violations_pca32;
+    uint64_t strict_violations_pca64;
 
     /* Categoria 2: Excesos dentro del margen de diagnostico del auditor (0.0 < Delta <= eps_diag) */
     uint64_t diag_margin_events_partition;
     uint64_t diag_margin_events_radial;
     uint64_t diag_margin_events_pca16;
     uint64_t diag_margin_events_pca32;
+    uint64_t diag_margin_events_pca64;
 
     /* Categoria 3: Violaciones superiores al umbral de diagnostico (Delta > eps_diag) */
     uint64_t diag_exceed_violations_partition;
     uint64_t diag_exceed_violations_radial;
     uint64_t diag_exceed_violations_pca16;
     uint64_t diag_exceed_violations_pca32;
+    uint64_t diag_exceed_violations_pca64;
 
     uint64_t false_prunings_topk;
 
@@ -144,7 +149,7 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
 
 /*
  * Plan 5B: IVF + Poda Exacta Multi-Nivel con Cota PCA Centrada por Particion y Distancia Final en Espacio Original
- * (Particion + Cascara Radial + Base Ortogonal PCA con ||q_tail - c_{p,tail}|| vs ||x_tail - c_{p,tail}|| en 16D/32D)
+ * (Particion + Cascara Radial + Base Ortogonal PCA en 16D/32D/64D con redondeo dirigido conservador)
  */
 void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
                                               const float* q,
@@ -155,7 +160,8 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
                                               QueryExecutionMetrics& metrics);
 
 /*
- * Auditoria de Exactitud Nivel 3 (Hito 2A.1): Verifica sin tolerancia oculta cada descarte de 5B
+ * Auditoria de Exactitud Nivel 3 (Hito 2A.2): Verifica sin tolerancia oculta cada descarte
+ * de las 5 etapas de 5B (Particion, Radial, PCA 16D, PCA 32D y PCA 64D).
  */
 void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                                     const float* q,

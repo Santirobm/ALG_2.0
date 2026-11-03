@@ -1,4 +1,4 @@
-Project: ALG-Flat 2.0 (Hito 1 + Hito 2A.1 Formal IEEE-754 Exactness Audit)
+Project: ALG-Flat 2.0 (Hito 1 + Hito 2A.2 Formal 5-Stage IEEE-754 Exactness Audit with Directed Rounding)
 Compiler: Clang 22.1.8
 Compile_Flags: -O3 -march=native -mavx2 -mfma -std=c++17
 CPU: Intel Core i5-13500 (24 MB Intel Smart Cache L3)
@@ -11,6 +11,7 @@ Seed: 8
 Warm_Queries: 500 (after 20 warmup queries per plan)
 Cold_Queries: 40 (with 36 MB LLC eviction buffer + _mm_mfence before each query)
 Plan_Execution_Order: 0_Ref_Hito9 -> 1_Scalar -> 2A_AVX2_1x -> 2B_AVX2_4x -> 3A_SoA -> 3B_AoSoA -> 4_IVF_Flat -> 5A_IVF_PartPrune -> 5B_IVF_FullExactPrune
-IEEE754_Unit_Roundoff_u: 5.9604644775390625e-8 (2^-24)
-IEEE754_Gamma_Constants: gamma_16=9.53675e-07, gamma_64=3.81471e-06, gamma_66=3.93392e-06
+IEEE754_Unit_Roundoff_u32: 5.9604644775390625e-8 (2^-24), u64: 1.1102230246251565e-16 (2^-53)
+IEEE754_Directed_Rounding: round_up_f32 (+infty via nextafterf) for slacks/upper bounds, round_down_f32 (0 via nextafterf) for scale_safe/lower bounds
+IEEE754_Gamma_Constants: gamma_17=1.01328e-06, gamma_33=1.96696e-06, gamma_64=3.81471e-06, gamma_66=3.93392e-06, gamma_67=3.99353e-06
 Recall_Metrics: IDSetRecall (duplicate-checked exact ID set membership, 0 distance tolerance) + RankMatch (position-by-position identity under dist_sq ASC, id ASC)

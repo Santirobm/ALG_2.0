@@ -379,7 +379,7 @@ void execute_plan3b_flat_avx2_aosoa(const FlatAoSoAIndex& idx,
                        + static_cast<uint64_t>(num_blocks) * 8U * sizeof(uint32_t);
 }
 
-/* Rota el vector centrado (q - mu) por Q^T */
+/* Rota el vector centrado (q - mu) por Q^T y calcula cota superior de ||q - mu||_2 */
 static inline void rotate_centered_query_avx2(const float* qt,
                                               const float* q,
                                               const float* mean,
@@ -393,7 +393,8 @@ static inline void rotate_centered_query_avx2(const float* qt,
         _mm256_store_ps(q_diff + d, diff);
         v_norm_sq = _mm256_fmadd_ps(diff, diff, v_norm_sq);
     }
-    out_q_mean_norm = sqrtf(hsum256_ps_fast(v_norm_sq)) * (1.0f + GAMMA_66_F32);
+    double raw_norm = std::sqrt(static_cast<double>(hsum256_ps_fast(v_norm_sq)));
+    out_q_mean_norm = round_up_f32(raw_norm / std::sqrt(1.0 - ieee754_gamma(66)));
 
     for (uint32_t r = 0; r < dim; ++r) {
         const float* row = qt + static_cast<size_t>(r) * dim;
@@ -409,10 +410,10 @@ static inline void rotate_centered_query_avx2(const float* qt,
 
 struct PartitionOrder {
     uint32_t part_id;
-    float dc;       /* ||q - c_p||_2 en espacio original */
-    float dc_low;   /* dc * (1 - gamma_66) */
-    float dc_high;  /* dc * (1 + gamma_66) */
-    float lb_safe;  /* Cota inferior certificada en unidades de sqrt(fl_orig(||q-x||_2^2)) */
+    float dc;           /* ||q - c_p||_2 en espacio original */
+    float dc_low;       /* Redondeado hacia 0 */
+    float dc_high;      /* Redondeado hacia +inf */
+    float lb_part_sq;   /* Cota inferior certificada de particion al cuadrado (redondeada hacia 0) */
 };
 
 /*
@@ -520,19 +521,13 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
 
     const uint32_t dim = idx.dim;
     const uint32_t n_parts = idx.num_partitions;
-    const float scale_part = (1.0f - GAMMA_66_F32) * (1.0f - 2.0f * U_F32);
 
     PartitionOrder p_order[512];
     for (uint32_t p = 0; p < n_parts; ++p) {
         float d2 = l2_sq_avx2_1x_aos(q, idx.centroids + static_cast<size_t>(p) * dim, dim);
-        float dc = sqrtf(d2);
-        float dc_low = dc * (1.0f - GAMMA_66_F32);
-        float dc_high = dc * (1.0f + GAMMA_66_F32);
         const GeometricPartition& gp = idx.partitions[p];
-        float raw_lb = 0.0f;
-        if (dc_low > gp.max_radius) raw_lb = dc_low - gp.max_radius;
-        else if (dc_high < gp.min_radius) raw_lb = gp.min_radius - dc_high;
-        p_order[p] = {p, dc, dc_low, dc_high, raw_lb * scale_part};
+        PartitionDistanceBounds pdb = compute_partition_distance_bounds(d2, gp.min_radius, gp.max_radius);
+        p_order[p] = {p, pdb.dc, pdb.dc_low, pdb.dc_high, pdb.lb_part_sq};
     }
     std::sort(p_order, p_order + n_parts, [](const PartitionOrder& a, const PartitionOrder& b) {
         return a.dc < b.dc;
@@ -557,8 +552,7 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
         if (e_start >= e_end) continue;
 
         if (heap.size == k) {
-            float lb_sq = (p_order[pi].lb_safe * p_order[pi].lb_safe) * (1.0f - 2.0f * U_F32);
-            if (lb_sq > heap.threshold_sq) {
+            if (p_order[pi].lb_part_sq > heap.threshold_sq) {
                 continue;
             }
         }
@@ -613,6 +607,7 @@ void execute_plan5a_ivf_part_prune_avx2(const IVFPartitionedIndex& idx,
 
 /*
  * Kernel 4x1 Progresivo en Base Rotada PCA Centrada por Particion con Cotas IEEE-754 Derivadas
+ * y Redondeo Dirigido por Etapa (16D -> gamma_17, 32D -> gamma_33, 64D -> gamma_67)
  */
 static inline void eval_4x_pca_progressive_certified(const float* q_orig,
                                                      const float* q_rot_p,
@@ -664,8 +659,8 @@ static inline void eval_4x_pca_progressive_certified(const float* q_orig,
     __m128 raw_diff = _mm_sub_ps(_mm_set1_ps(q_tail48_p), b4);
     __m128 abs_diff = _mm_andnot_ps(_mm_set1_ps(-0.0f), raw_diff);
     __m128 lb_tail = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(abs_diff, _mm_set1_ps(bounds.fp_slack_p)));
-    __m128 d16_safe = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(d16_4, _mm_set1_ps(bounds.sq_slack_p)));
-    __m128 lb64_4 = _mm_mul_ps(_mm_fmadd_ps(lb_tail, lb_tail, d16_safe), _mm_set1_ps(bounds.scale_safe));
+    __m128 d16_safe = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(d16_4, _mm_set1_ps(bounds.sq_slack_16_p)));
+    __m128 lb64_4 = _mm_mul_ps(_mm_fmadd_ps(lb_tail, lb_tail, d16_safe), _mm_set1_ps(bounds.scale_safe_16));
 
     int mask16 = _mm_movemask_ps(_mm_cmple_ps(lb64_4, _mm_set1_ps(heap.threshold_sq)));
     if (mask16 == 0) {
@@ -691,8 +686,8 @@ static inline void eval_4x_pca_progressive_certified(const float* q_orig,
 
         float abs_t32 = std::fabs(q_tail32_p - idx.part_aos_tail32_norm[iv]);
         float lb_t32 = (abs_t32 > bounds.fp_slack_p) ? (abs_t32 - bounds.fp_slack_p) : 0.0f;
-        float d32_safe = (d32 > bounds.sq_slack_p) ? (d32 - bounds.sq_slack_p) : 0.0f;
-        float lb64_stage2 = bounds.scale_safe * (d32_safe + lb_t32 * lb_t32);
+        float d32_safe = (d32 > bounds.sq_slack_32_p) ? (d32 - bounds.sq_slack_32_p) : 0.0f;
+        float lb64_stage2 = bounds.scale_safe_32 * (d32_safe + lb_t32 * lb_t32);
         if (lb64_stage2 > heap.threshold_sq) {
             continue;
         }
@@ -710,8 +705,8 @@ static inline void eval_4x_pca_progressive_certified(const float* q_orig,
         quarter_evals += 2;
         bytes_read += 128;
 
-        float d64_safe = (d64_rot > bounds.sq_slack_p) ? (d64_rot - bounds.sq_slack_p) : 0.0f;
-        if (bounds.scale_safe * d64_safe <= heap.threshold_sq) {
+        float d64_safe = (d64_rot > bounds.sq_slack_64_p) ? (d64_rot - bounds.sq_slack_64_p) : 0.0f;
+        if (bounds.scale_safe_64 * d64_safe <= heap.threshold_sq) {
             /* Nivel 2 de Certificacion: Recalcular distancia final exacta en el espacio original float32 */
             const float* orig_vp = idx.part_orig_vectors + static_cast<size_t>(iv) * 64U;
             float d_orig = l2_hito9_ref(q_orig, orig_vp, 64U);
@@ -738,20 +733,13 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
     float q_mean_norm = 0.0f;
     rotate_centered_query_avx2(idx.ortho_basis, q, idx.global_mean, q_rot, q_mean_norm, dim);
 
-    const float scale_part = (1.0f - GAMMA_66_F32) * (1.0f - 2.0f * U_F32);
     PartitionOrder p_order[512];
     for (uint32_t p = 0; p < n_parts; ++p) {
         float d2 = l2_sq_avx2_1x_aos(q, idx.centroids + static_cast<size_t>(p) * dim, dim);
-        float dc = sqrtf(d2);
-        float dc_low = dc * (1.0f - GAMMA_66_F32);
-        float dc_high = dc * (1.0f + GAMMA_66_F32);
         const GeometricPartition& gp = idx.partitions[p];
-        float raw_lb = 0.0f;
-        if (dc_low > gp.max_radius) raw_lb = dc_low - gp.max_radius;
-        else if (dc_high < gp.min_radius) raw_lb = gp.min_radius - dc_high;
-        p_order[p] = {p, dc, dc_low, dc_high, raw_lb * scale_part};
+        PartitionDistanceBounds pdb = compute_partition_distance_bounds(d2, gp.min_radius, gp.max_radius);
+        p_order[p] = {p, pdb.dc, pdb.dc_low, pdb.dc_high, pdb.lb_part_sq};
     }
-
     std::sort(p_order, p_order + n_parts, [](const PartitionOrder& a, const PartitionOrder& b) {
         return a.dc < b.dc;
     });
@@ -780,16 +768,13 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
         const GeometricPartition& gp = idx.partitions[pid];
 
         if (heap.size == k) {
-            float lb_part_sq = (p_order[pi].lb_safe * p_order[pi].lb_safe) * (1.0f - 2.0f * U_F32);
-            if (lb_part_sq > heap.threshold_sq) {
+            if (p_order[pi].lb_part_sq > heap.threshold_sq) {
                 continue; /* Nivel 1: Particion entera descartada con garantia conservadora */
             }
 
-            /* Nivel 2: Poda Exacta Conservadora de Cascara Radial [r_low, r_high] */
-            float rho_orig_upper = sqrtf(heap.threshold_sq) / scale_part;
-            float r_pad = U_F32 * gp.max_radius;
-            float r_low = dc_low - rho_orig_upper - r_pad;
-            float r_high = dc_high + rho_orig_upper + r_pad;
+            /* Nivel 2: Poda Exacta Conservadora de Cascara Radial [r_low, r_high] con redondeo dirigido */
+            float r_low = 0.0f, r_high = 0.0f, r_pad = 0.0f;
+            compute_radial_shell_interval(dc_low, dc_high, gp.max_radius, heap.threshold_sq, r_low, r_high, r_pad);
 
             if (r_low > gp.min_radius) {
                 uint32_t lo = e_start, hi = e_end;
@@ -891,8 +876,8 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
 
             float abs_t48 = std::fabs(q_tail48_p - idx.part_aos_tail48_norm[iv]);
             float lb_t48 = (abs_t48 > bounds.fp_slack_p) ? (abs_t48 - bounds.fp_slack_p) : 0.0f;
-            float d16_safe = (d16 > bounds.sq_slack_p) ? (d16 - bounds.sq_slack_p) : 0.0f;
-            if (bounds.scale_safe * (d16_safe + lb_t48 * lb_t48) > heap.threshold_sq) continue;
+            float d16_safe = (d16 > bounds.sq_slack_16_p) ? (d16 - bounds.sq_slack_16_p) : 0.0f;
+            if (bounds.scale_safe_16 * (d16_safe + lb_t48 * lb_t48) > heap.threshold_sq) continue;
 
             __m256 qa = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 16), _mm256_load_ps(vp + 16));
             __m256 qb = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 24), _mm256_load_ps(vp + 24));
@@ -902,14 +887,26 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
 
             float abs_t32 = std::fabs(q_tail32_p - idx.part_aos_tail32_norm[iv]);
             float lb_t32 = (abs_t32 > bounds.fp_slack_p) ? (abs_t32 - bounds.fp_slack_p) : 0.0f;
-            float d32_safe = (d32 > bounds.sq_slack_p) ? (d32 - bounds.sq_slack_p) : 0.0f;
-            if (bounds.scale_safe * (d32_safe + lb_t32 * lb_t32) > heap.threshold_sq) continue;
+            float d32_safe = (d32 > bounds.sq_slack_32_p) ? (d32 - bounds.sq_slack_32_p) : 0.0f;
+            if (bounds.scale_safe_32 * (d32_safe + lb_t32 * lb_t32) > heap.threshold_sq) continue;
 
+            __m256 qc = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 32), _mm256_load_ps(vp + 32));
+            __m256 qd = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 40), _mm256_load_ps(vp + 40));
+            __m256 acc_tail0 = _mm256_fmadd_ps(qc, qc, _mm256_mul_ps(qd, qd));
+
+            __m256 qe = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 48), _mm256_load_ps(vp + 48));
+            __m256 qf = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 56), _mm256_load_ps(vp + 56));
+            __m256 acc_tail1 = _mm256_fmadd_ps(qe, qe, _mm256_mul_ps(qf, qf));
+
+            float d64_rot = d32 + hsum256_ps_fast(_mm256_add_ps(acc_tail0, acc_tail1));
             quarter_evals += 2;
-            total_bytes += 256;
-            const float* orig_vp = base_orig + static_cast<size_t>(iv) * 64U;
-            float d_orig = l2_hito9_ref(q, orig_vp, 64U);
-            if (d_orig <= heap.threshold_sq) {
+            total_bytes += 128;
+
+            float d64_safe = (d64_rot > bounds.sq_slack_64_p) ? (d64_rot - bounds.sq_slack_64_p) : 0.0f;
+            if (bounds.scale_safe_64 * d64_safe <= heap.threshold_sq) {
+                const float* orig_vp = base_orig + static_cast<size_t>(iv) * 64U;
+                float d_orig = l2_hito9_ref(q, orig_vp, 64U);
+                total_bytes += 256;
                 heap.push(idx.part_aos_ids[iv], d_orig);
             }
         }
@@ -928,10 +925,10 @@ void execute_plan5b_ivf_full_exact_prune_avx2(const IVFPartitionedIndex& idx,
 }
 
 /*
- * Auditoria Directa de Poda sin Tolerancia Oculta (Hito 2A.1 - Nivel 3):
- * Mide el exceso firmado exacto:
+ * Auditoria Directa de Poda sin Tolerancia Oculta en las 5 Etapas (Hito 2A.2 - Nivel 3):
+ * Reproduce exactamente todas las etapas de descarte de produccion (Particion, Radial,
+ * PCA 16D, PCA 32D y PCA 64D) y mide para cada descarte el exceso firmado:
  *   Delta(q, x) = LB_safe^2(q, x) - d_orig^2(q, x)
- * sin ocultar ningun exceso positivo detras de una tolerancia.
  */
 void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                                     const float* q,
@@ -946,18 +943,12 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
     float q_mean_norm = 0.0f;
     rotate_centered_query_avx2(idx.ortho_basis, q, idx.global_mean, q_rot, q_mean_norm, dim);
 
-    const float scale_part = (1.0f - GAMMA_66_F32) * (1.0f - 2.0f * U_F32);
     PartitionOrder p_order[512];
     for (uint32_t p = 0; p < n_parts; ++p) {
         float d2 = l2_sq_avx2_1x_aos(q, idx.centroids + static_cast<size_t>(p) * dim, dim);
-        float dc = sqrtf(d2);
-        float dc_low = dc * (1.0f - GAMMA_66_F32);
-        float dc_high = dc * (1.0f + GAMMA_66_F32);
         const GeometricPartition& gp = idx.partitions[p];
-        float raw_lb = 0.0f;
-        if (dc_low > gp.max_radius) raw_lb = dc_low - gp.max_radius;
-        else if (dc_high < gp.min_radius) raw_lb = gp.min_radius - dc_high;
-        p_order[p] = {p, dc, dc_low, dc_high, raw_lb * scale_part};
+        PartitionDistanceBounds pdb = compute_partition_distance_bounds(d2, gp.min_radius, gp.max_radius);
+        p_order[p] = {p, pdb.dc, pdb.dc_low, pdb.dc_high, pdb.lb_part_sq};
     }
 
     std::sort(p_order, p_order + n_parts, [](const PartitionOrder& a, const PartitionOrder& b) {
@@ -1030,7 +1021,7 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
         const GeometricPartition& gp = idx.partitions[pid];
 
         if (heap.size == k) {
-            float lb_part_sq = (p_order[pi].lb_safe * p_order[pi].lb_safe) * (1.0f - 2.0f * U_F32);
+            float lb_part_sq = p_order[pi].lb_part_sq;
             if (lb_part_sq > heap.threshold_sq) {
                 for (uint32_t e = e_start; e < e_end; ++e) {
                     report.total_eligible_checked++;
@@ -1044,10 +1035,8 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                 continue;
             }
 
-            float rho_orig_upper = sqrtf(heap.threshold_sq) / scale_part;
-            float r_pad = U_F32 * gp.max_radius;
-            float r_low = dc_low - rho_orig_upper - r_pad;
-            float r_high = dc_high + rho_orig_upper + r_pad;
+            float r_low = 0.0f, r_high = 0.0f, r_pad = 0.0f;
+            compute_radial_shell_interval(dc_low, dc_high, gp.max_radius, heap.threshold_sq, r_low, r_high, r_pad);
 
             uint32_t orig_e_start = e_start;
             uint32_t orig_e_end = e_end;
@@ -1075,10 +1064,10 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                 uint32_t iv = el_ivf_ids[e];
                 report.total_eligible_checked++;
                 report.pruned_by_radial_shell++;
-                float r_x = idx.part_aos_radii[iv];
-                float raw_rad = (dc_low > r_x + r_pad) ? (dc_low - r_x - r_pad) : 0.0f;
-                float lb_rad_safe = raw_rad * scale_part;
-                float lb_rad_sq = (lb_rad_safe * lb_rad_safe) * (1.0f - 2.0f * U_F32);
+                double r_x = static_cast<double>(idx.part_aos_radii[iv]);
+                double raw_rad = (static_cast<double>(dc_low) > r_x + static_cast<double>(r_pad))
+                               ? (static_cast<double>(dc_low) - r_x - static_cast<double>(r_pad)) : 0.0;
+                float lb_rad_sq = round_down_f32((raw_rad * raw_rad) * (1.0 - ieee754_gamma(66)));
                 record_pruned_check(iv,
                                     static_cast<double>(lb_rad_sq),
                                     report.strict_violations_radial,
@@ -1089,10 +1078,10 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                 uint32_t iv = el_ivf_ids[e];
                 report.total_eligible_checked++;
                 report.pruned_by_radial_shell++;
-                float r_x = idx.part_aos_radii[iv];
-                float raw_rad = (r_x > dc_high + r_pad) ? (r_x - dc_high - r_pad) : 0.0f;
-                float lb_rad_safe = raw_rad * scale_part;
-                float lb_rad_sq = (lb_rad_safe * lb_rad_safe) * (1.0f - 2.0f * U_F32);
+                double r_x = static_cast<double>(idx.part_aos_radii[iv]);
+                double raw_rad = (r_x > static_cast<double>(dc_high) + static_cast<double>(r_pad))
+                               ? (r_x - static_cast<double>(dc_high) - static_cast<double>(r_pad)) : 0.0;
+                float lb_rad_sq = round_down_f32((raw_rad * raw_rad) * (1.0 - ieee754_gamma(66)));
                 record_pruned_check(iv,
                                     static_cast<double>(lb_rad_sq),
                                     report.strict_violations_radial,
@@ -1104,6 +1093,25 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
         }
 
         uint32_t e = e_start;
+        while (e + 4 <= e_end && heap.size < k) {
+            uint32_t iv0 = el_ivf_ids[e];
+            uint32_t iv1 = el_ivf_ids[e + 1];
+            uint32_t iv2 = el_ivf_ids[e + 2];
+            uint32_t iv3 = el_ivf_ids[e + 3];
+            report.total_eligible_checked += 4;
+            report.evaluated_full_64d += 4;
+
+            const float* v0 = base_orig + static_cast<size_t>(iv0) * dim;
+            const float* v1 = base_orig + static_cast<size_t>(iv1) * dim;
+            const float* v2 = base_orig + static_cast<size_t>(iv2) * dim;
+            const float* v3 = base_orig + static_cast<size_t>(iv3) * dim;
+
+            heap.push(idx.part_aos_ids[iv0], l2_hito9_ref(q, v0, dim));
+            heap.push(idx.part_aos_ids[iv1], l2_hito9_ref(q, v1, dim));
+            heap.push(idx.part_aos_ids[iv2], l2_hito9_ref(q, v2, dim));
+            heap.push(idx.part_aos_ids[iv3], l2_hito9_ref(q, v3, dim));
+            e += 4;
+        }
         while (e < e_end && heap.size < k) {
             uint32_t iv = el_ivf_ids[e];
             report.total_eligible_checked++;
@@ -1142,19 +1150,139 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
             q_mean_norm, idx.centroid_mean_norms[pid], dc_high, gp.max_radius, idx.ortho_defect
         );
 
+        /* Reproduccion exacta bit a bit del bucle 4x SIMD de eval_4x_pca_progressive_certified */
+        for (; e + 4 <= e_end; e += 4) {
+            uint32_t iv0 = el_ivf_ids[e];
+            uint32_t iv1 = el_ivf_ids[e + 1];
+            uint32_t iv2 = el_ivf_ids[e + 2];
+            uint32_t iv3 = el_ivf_ids[e + 3];
+            report.total_eligible_checked += 4;
+
+            const float* v0 = idx.part_aos_vectors + static_cast<size_t>(iv0) * 64U;
+            const float* v1 = idx.part_aos_vectors + static_cast<size_t>(iv1) * 64U;
+            const float* v2 = idx.part_aos_vectors + static_cast<size_t>(iv2) * 64U;
+            const float* v3 = idx.part_aos_vectors + static_cast<size_t>(iv3) * 64U;
+
+            __m256 q0 = _mm256_load_ps(q_rot_p + 0);
+            __m256 q1 = _mm256_load_ps(q_rot_p + 8);
+
+            __m256 d0_a = _mm256_sub_ps(q0, _mm256_load_ps(v0 + 0));
+            __m256 d0_b = _mm256_sub_ps(q1, _mm256_load_ps(v0 + 8));
+            __m256 acc0 = _mm256_fmadd_ps(d0_a, d0_a, _mm256_mul_ps(d0_b, d0_b));
+
+            __m256 d1_a = _mm256_sub_ps(q0, _mm256_load_ps(v1 + 0));
+            __m256 d1_b = _mm256_sub_ps(q1, _mm256_load_ps(v1 + 8));
+            __m256 acc1 = _mm256_fmadd_ps(d1_a, d1_a, _mm256_mul_ps(d1_b, d1_b));
+
+            __m256 d2_a = _mm256_sub_ps(q0, _mm256_load_ps(v2 + 0));
+            __m256 d2_b = _mm256_sub_ps(q1, _mm256_load_ps(v2 + 8));
+            __m256 acc2 = _mm256_fmadd_ps(d2_a, d2_a, _mm256_mul_ps(d2_b, d2_b));
+
+            __m256 d3_a = _mm256_sub_ps(q0, _mm256_load_ps(v3 + 0));
+            __m256 d3_b = _mm256_sub_ps(q1, _mm256_load_ps(v3 + 8));
+            __m256 acc3 = _mm256_fmadd_ps(d3_a, d3_a, _mm256_mul_ps(d3_b, d3_b));
+
+            __m256 t0 = _mm256_hadd_ps(acc0, acc1);
+            __m256 t1 = _mm256_hadd_ps(acc2, acc3);
+            __m256 t2 = _mm256_hadd_ps(t0, t1);
+            __m128 d16_4 = _mm_add_ps(_mm256_castps256_ps128(t2), _mm256_extractf128_ps(t2, 1));
+
+            __m128 b4 = _mm_set_ps(idx.part_aos_tail48_norm[iv3],
+                                   idx.part_aos_tail48_norm[iv2],
+                                   idx.part_aos_tail48_norm[iv1],
+                                   idx.part_aos_tail48_norm[iv0]);
+            __m128 raw_diff = _mm_sub_ps(_mm_set1_ps(q_tail48_p), b4);
+            __m128 abs_diff = _mm_andnot_ps(_mm_set1_ps(-0.0f), raw_diff);
+            __m128 lb_tail = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(abs_diff, _mm_set1_ps(bounds.fp_slack_p)));
+            __m128 d16_safe = _mm_max_ps(_mm_setzero_ps(), _mm_sub_ps(d16_4, _mm_set1_ps(bounds.sq_slack_16_p)));
+            __m128 lb64_4 = _mm_mul_ps(_mm_fmadd_ps(lb_tail, lb_tail, d16_safe), _mm_set1_ps(bounds.scale_safe_16));
+
+            int mask16 = _mm_movemask_ps(_mm_cmple_ps(lb64_4, _mm_set1_ps(heap.threshold_sq)));
+
+            alignas(16) float p16[4];
+            alignas(16) float lb16_vals[4];
+            _mm_store_ps(p16, d16_4);
+            _mm_store_ps(lb16_vals, lb64_4);
+            const uint32_t ivs[4] = {iv0, iv1, iv2, iv3};
+            const float* v_ptrs[4] = {v0, v1, v2, v3};
+
+            for (int lane = 0; lane < 4; ++lane) {
+                uint32_t iv = ivs[lane];
+                if (!(mask16 & (1 << lane))) {
+                    report.pruned_by_pca_16d++;
+                    record_pruned_check(iv,
+                                        static_cast<double>(lb16_vals[lane]),
+                                        report.strict_violations_pca16,
+                                        report.diag_margin_events_pca16,
+                                        report.diag_exceed_violations_pca16);
+                    continue;
+                }
+
+                const float* vp = v_ptrs[lane];
+
+                /* Etapa 2: PCA 32D + cola 32D */
+                __m256 qa = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 16), _mm256_load_ps(vp + 16));
+                __m256 qb = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 24), _mm256_load_ps(vp + 24));
+                float d32 = p16[lane] + hsum256_ps_fast(_mm256_fmadd_ps(qa, qa, _mm256_mul_ps(qb, qb)));
+
+                float abs_t32 = std::fabs(q_tail32_p - idx.part_aos_tail32_norm[iv]);
+                float lb_t32 = (abs_t32 > bounds.fp_slack_p) ? (abs_t32 - bounds.fp_slack_p) : 0.0f;
+                float d32_safe = (d32 > bounds.sq_slack_32_p) ? (d32 - bounds.sq_slack_32_p) : 0.0f;
+                float lb64_stage2 = bounds.scale_safe_32 * (d32_safe + lb_t32 * lb_t32);
+                if (lb64_stage2 > heap.threshold_sq) {
+                    report.pruned_by_pca_32d++;
+                    record_pruned_check(iv,
+                                        static_cast<double>(lb64_stage2),
+                                        report.strict_violations_pca32,
+                                        report.diag_margin_events_pca32,
+                                        report.diag_exceed_violations_pca32);
+                    continue;
+                }
+
+                /* Etapa 3: PCA 64D completo en espacio rotado */
+                __m256 qc = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 32), _mm256_load_ps(vp + 32));
+                __m256 qd = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 40), _mm256_load_ps(vp + 40));
+                __m256 acc_tail0 = _mm256_fmadd_ps(qc, qc, _mm256_mul_ps(qd, qd));
+
+                __m256 qe = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 48), _mm256_load_ps(vp + 48));
+                __m256 qf = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 56), _mm256_load_ps(vp + 56));
+                __m256 acc_tail1 = _mm256_fmadd_ps(qe, qe, _mm256_mul_ps(qf, qf));
+
+                float d64_rot = d32 + hsum256_ps_fast(_mm256_add_ps(acc_tail0, acc_tail1));
+                float d64_safe = (d64_rot > bounds.sq_slack_64_p) ? (d64_rot - bounds.sq_slack_64_p) : 0.0f;
+                float lb64_stage3 = bounds.scale_safe_64 * d64_safe;
+                if (lb64_stage3 > heap.threshold_sq) {
+                    report.pruned_by_pca_64d++;
+                    record_pruned_check(iv,
+                                        static_cast<double>(lb64_stage3),
+                                        report.strict_violations_pca64,
+                                        report.diag_margin_events_pca64,
+                                        report.diag_exceed_violations_pca64);
+                    continue;
+                }
+
+                report.evaluated_full_64d++;
+                const float* orig_vp = base_orig + static_cast<size_t>(iv) * 64U;
+                float d_orig = l2_hito9_ref(q, orig_vp, 64U);
+                heap.push(idx.part_aos_ids[iv], d_orig);
+            }
+        }
+
+        /* Cola escalar para los 0..3 elementos restantes */
         for (; e < e_end; ++e) {
             uint32_t iv = el_ivf_ids[e];
             report.total_eligible_checked++;
             const float* vp = idx.part_aos_vectors + static_cast<size_t>(iv) * 64U;
 
+            /* Etapa 1: PCA 16D + cola 48D */
             __m256 q0 = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 0), _mm256_load_ps(vp + 0));
             __m256 q1 = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 8), _mm256_load_ps(vp + 8));
             float d16 = hsum256_ps_fast(_mm256_fmadd_ps(q0, q0, _mm256_mul_ps(q1, q1)));
 
             float abs_t48 = std::fabs(q_tail48_p - idx.part_aos_tail48_norm[iv]);
             float lb_t48 = (abs_t48 > bounds.fp_slack_p) ? (abs_t48 - bounds.fp_slack_p) : 0.0f;
-            float d16_safe = (d16 > bounds.sq_slack_p) ? (d16 - bounds.sq_slack_p) : 0.0f;
-            float lb64_s1 = bounds.scale_safe * (d16_safe + lb_t48 * lb_t48);
+            float d16_safe = (d16 > bounds.sq_slack_16_p) ? (d16 - bounds.sq_slack_16_p) : 0.0f;
+            float lb64_s1 = bounds.scale_safe_16 * (d16_safe + lb_t48 * lb_t48);
             if (lb64_s1 > heap.threshold_sq) {
                 report.pruned_by_pca_16d++;
                 record_pruned_check(iv,
@@ -1165,14 +1293,15 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                 continue;
             }
 
+            /* Etapa 2: PCA 32D + cola 32D */
             __m256 qa = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 16), _mm256_load_ps(vp + 16));
             __m256 qb = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 24), _mm256_load_ps(vp + 24));
             float d32 = d16 + hsum256_ps_fast(_mm256_fmadd_ps(qa, qa, _mm256_mul_ps(qb, qb)));
 
             float abs_t32 = std::fabs(q_tail32_p - idx.part_aos_tail32_norm[iv]);
             float lb_t32 = (abs_t32 > bounds.fp_slack_p) ? (abs_t32 - bounds.fp_slack_p) : 0.0f;
-            float d32_safe = (d32 > bounds.sq_slack_p) ? (d32 - bounds.sq_slack_p) : 0.0f;
-            float lb64_s2 = bounds.scale_safe * (d32_safe + lb_t32 * lb_t32);
+            float d32_safe = (d32 > bounds.sq_slack_32_p) ? (d32 - bounds.sq_slack_32_p) : 0.0f;
+            float lb64_s2 = bounds.scale_safe_32 * (d32_safe + lb_t32 * lb_t32);
             if (lb64_s2 > heap.threshold_sq) {
                 report.pruned_by_pca_32d++;
                 record_pruned_check(iv,
@@ -1183,12 +1312,32 @@ void audit_plan5b_pruning_soundness(const IVFPartitionedIndex& idx,
                 continue;
             }
 
+            /* Etapa 3: PCA 64D completo en espacio rotado */
+            __m256 qc = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 32), _mm256_load_ps(vp + 32));
+            __m256 qd = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 40), _mm256_load_ps(vp + 40));
+            __m256 acc_tail0 = _mm256_fmadd_ps(qc, qc, _mm256_mul_ps(qd, qd));
+
+            __m256 qe = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 48), _mm256_load_ps(vp + 48));
+            __m256 qf = _mm256_sub_ps(_mm256_load_ps(q_rot_p + 56), _mm256_load_ps(vp + 56));
+            __m256 acc_tail1 = _mm256_fmadd_ps(qe, qe, _mm256_mul_ps(qf, qf));
+
+            float d64_rot = d32 + hsum256_ps_fast(_mm256_add_ps(acc_tail0, acc_tail1));
+            float d64_safe = (d64_rot > bounds.sq_slack_64_p) ? (d64_rot - bounds.sq_slack_64_p) : 0.0f;
+            float lb64_s3 = bounds.scale_safe_64 * d64_safe;
+            if (lb64_s3 > heap.threshold_sq) {
+                report.pruned_by_pca_64d++;
+                record_pruned_check(iv,
+                                    static_cast<double>(lb64_s3),
+                                    report.strict_violations_pca64,
+                                    report.diag_margin_events_pca64,
+                                    report.diag_exceed_violations_pca64);
+                continue;
+            }
+
             report.evaluated_full_64d++;
             const float* orig_vp = base_orig + static_cast<size_t>(iv) * 64U;
             float d_orig = l2_hito9_ref(q, orig_vp, 64U);
-            if (d_orig <= heap.threshold_sq) {
-                heap.push(idx.part_aos_ids[iv], d_orig);
-            }
+            heap.push(idx.part_aos_ids[iv], d_orig);
         }
     }
 }

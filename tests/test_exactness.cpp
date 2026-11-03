@@ -12,10 +12,65 @@
 using namespace alg_flat;
 
 /*
+ * Verificacion unitaria de las invariantes de redondeo dirigido en IEEE-754 (Hito 2A.2):
+ * Comprueba que para cualquier rango de normas y radios:
+ *   - delta_vec_p, fp_slack_p, sq_slack_{16,32,64}_p son estrictamente mayores o iguales
+ *     que sus valores matematicos en precision doble (redondeo hacia +infinito).
+ *   - scale_safe_{16,32,64} son estrictamente menores o iguales que sus factores matematicos
+ *     en precision doble (redondeo hacia 0).
+ */
+static void verify_directed_rounding_invariants() {
+    const double scales[6] = {1e-2, 0.25, 1.0, 15.0, 500.0, 25000.0};
+    for (int i = 0; i < 6; ++i) {
+        float q_norm = static_cast<float>(scales[i] * 1.37);
+        float c_norm = static_cast<float>(scales[i] * 0.91);
+        float dc_hi  = static_cast<float>(scales[i] * 0.63);
+        float r_max  = static_cast<float>(scales[i] * 0.42);
+        float def    = 2.95e-7f;
+
+        PartitionCertifiedBounds b = compute_partition_certified_bounds(q_norm, c_norm, dc_hi, r_max, def);
+
+        double delta_vec_exact = ROT64_L2_COEFF_Q_F64 * static_cast<double>(q_norm)
+                               + ROT64_L2_COEFF_C_F64 * static_cast<double>(c_norm)
+                               + ROT64_L2_COEFF_X_F64 * static_cast<double>(r_max);
+        assert(static_cast<double>(b.delta_vec_p) >= delta_vec_exact &&
+               "Redondeo dirigido fallo: delta_vec_p debe ser >= delta_vec_exact!");
+
+        double dv = static_cast<double>(b.delta_vec_p);
+        double tail_err_exact = ieee754_gamma(64) * (static_cast<double>(dc_hi) + dv)
+                              + IEEE754_F32_U * static_cast<double>(r_max);
+        double fp_slack_exact = (1.0 + 4.0 * IEEE754_F32_U) * (dv + tail_err_exact);
+        assert(static_cast<double>(b.fp_slack_p) >= fp_slack_exact &&
+               "Redondeo dirigido fallo: fp_slack_p debe ser >= fp_slack_exact!");
+
+        double max_vec_norm = std::sqrt(1.0 + static_cast<double>(def))
+                            * (static_cast<double>(dc_hi) + static_cast<double>(r_max)) + dv;
+        double base_sq_exact = 2.0 * dv * max_vec_norm;
+        assert(static_cast<double>(b.sq_slack_16_p) >= base_sq_exact * (1.0 + ieee754_gamma(17)) &&
+               "Redondeo dirigido fallo: sq_slack_16_p debe ser >= cota exacta 16D!");
+        assert(static_cast<double>(b.sq_slack_32_p) >= base_sq_exact * (1.0 + ieee754_gamma(33)) &&
+               "Redondeo dirigido fallo: sq_slack_32_p debe ser >= cota exacta 32D!");
+        assert(static_cast<double>(b.sq_slack_64_p) >= base_sq_exact * (1.0 + ieee754_gamma(67)) &&
+               "Redondeo dirigido fallo: sq_slack_64_p debe ser >= cota exacta 64D!");
+
+        double common_num = (1.0 - ieee754_gamma(66)) * (1.0 - 6.0 * IEEE754_F32_U);
+        double den = 1.0 + static_cast<double>(def);
+        assert(static_cast<double>(b.scale_safe_16) <= (common_num * (1.0 - ieee754_gamma(17))) / den &&
+               "Redondeo dirigido fallo: scale_safe_16 debe ser <= factor exacto 16D!");
+        assert(static_cast<double>(b.scale_safe_32) <= (common_num * (1.0 - ieee754_gamma(33))) / den &&
+               "Redondeo dirigido fallo: scale_safe_32 debe ser <= factor exacto 32D!");
+        assert(static_cast<double>(b.scale_safe_64) <= (common_num * (1.0 - ieee754_gamma(67))) / den &&
+               "Redondeo dirigido fallo: scale_safe_64 debe ser <= factor exacto 64D!");
+        assert(b.sq_slack_16_p <= b.sq_slack_32_p && b.sq_slack_32_p <= b.sq_slack_64_p &&
+               "Monotonia de holgura cuadratica por etapa (16D <= 32D <= 64D) violada!");
+        assert(b.scale_safe_16 >= b.scale_safe_32 && b.scale_safe_32 >= b.scale_safe_64 &&
+               "Monotonia de factor de escala por etapa (16D >= 32D >= 64D) violada!");
+    }
+}
+
+/*
  * Nivel 1A: IDSetRecall (SIN tolerancia de distancia `dist_sq <= kth_gt_dist` y CON verificacion
  * explicita de ausencia de IDs duplicados en la salida predicha).
- * Cada ID predicho debe ser unico y pertenecer estrictamente al conjunto exacto de los K IDs del
- * Ground Truth definido por el orden total determinista (dist_sq_orig ASC, id ASC).
  */
 static double compute_id_set_recall(const Neighbor* pred, uint32_t pred_cnt,
                                     const Neighbor* gt, uint32_t gt_cnt, uint32_t k,
@@ -48,8 +103,6 @@ static double compute_id_set_recall(const Neighbor* pred, uint32_t pred_cnt,
 /*
  * Nivel 1B + Nivel 2: Identidad de Rango Posicion-a-Posicion (RankMatch@K) e Igualdad Exacta
  * de Distancia Original (MaxOrigDistErr).
- * Verifica que pred[r].id == gt[r].id en cada posicion r < K y que pred[r].dist_sq coincida
- * bit a bit con la distancia en el espacio original float32.
  */
 static void verify_rank_and_original_distance(const Neighbor* pred, uint32_t pred_cnt,
                                               const Neighbor* gt, uint32_t gt_cnt, uint32_t k,
@@ -81,7 +134,6 @@ static void make_adversarial_off_origin_dataset(BenchmarkDataset& ds) {
     const uint32_t nq = ds.header.num_queries;
     const uint32_t dim = ds.header.dimension;
 
-    /* Desplazar todo el sistema de coordenadas lejos del origen de forma anisotropica */
     for (uint32_t i = 0; i < nv; ++i) {
         float* v = ds.vectors + static_cast<size_t>(i) * dim;
         uint32_t basin = i % 64U;
@@ -102,30 +154,25 @@ static void make_adversarial_off_origin_dataset(BenchmarkDataset& ds) {
 
 /*
  * Prepara los vectores base para el Escenario Adversarial 3 con empates exactos de distancia
- * y pares separados por 1 ULP. Las consultas colineales respecto del centroide real c_p se
- * construyen y verifican una vez conocidas las particiones reales de K-Means.
+ * y pares separados por 1 ULP.
  */
 static void make_adversarial_ties_and_base_dataset(BenchmarkDataset& ds) {
     generate_dataset_deterministic(202, 20000, 60, 32, 0.05f, MIX_50_50, ds);
     const uint32_t dim = ds.header.dimension;
 
-    /* Asegurar densidad local suficiente (>= 140 elegibles por particion) para que r_K sea local
-     * a cada particion y permita podar vectores colineales x* dentro de su propia particion c_p */
     for (uint32_t i = 0; i < ds.header.num_vectors; ++i) {
         if ((i % 2U) == 0U) {
             ds.categories[i] = 0;
         }
     }
 
-    /* En las consultas 50..59 inyectar pares de vectores elegibles con distancias identicas (empates)
-     * y pares separados por 1 ULP alrededor de cada consulta */
     for (uint32_t q = 50; q < 60; ++q) {
         const float* qv = ds.queries[q].values;
         uint32_t base_vec = q * 200U;
         for (uint32_t m = 0; m < 16; ++m) {
             uint32_t vid = base_vec + m;
             float* target_v = ds.vectors + static_cast<size_t>(vid) * dim;
-            ds.categories[vid] = 0; /* Elegible en todas las selectividades */
+            ds.categories[vid] = 0;
             float offset = 0.010f + 0.001f * static_cast<float>(m / 2);
             for (uint32_t d = 0; d < dim; ++d) {
                 target_v[d] = qv[d] + ((d == (m % dim)) ? -offset : offset);
@@ -148,15 +195,8 @@ static void make_adversarial_ties_and_base_dataset(BenchmarkDataset& ds) {
 
 /*
  * Construye y verifica explicitamente consultas con colinealidad exacta respecto del centroide
- * real c_p asignado por K-Means en ivf_idx:
- *   - Caso A (q in [0, 14]) : (q - c_p) = alpha * (x* - c_p) en 64D (igualdad en cota radial).
- *   - Caso B (q in [15, 34]): ||q - c_p||_2 == ||x* - c_p||_2 (cota radial = 0, no poda en radial)
- *                             y q_rot[16..63] = alpha * x*_rot[16..63] (colinealidad pura en 16..63,
- *                             donde d_orig^2(q, x*) == LB_16_exact^2(q, x*) y x* se poda en PCA 16D).
- *   - Caso C (q in [35, 49]): ||q - c_p||_2 == ||x* - c_p||_2 y ||q_rot[16..63]||_2 == ||x*_rot[16..63]||_2
- *                             con q_rot[0..15] == x*_rot[0..15] (cotas radial y PCA 16D = 0, pasa a PCA 32D)
- *                             y q_rot[32..63] = alpha * x*_rot[32..63] (colinealidad pura en 32..63,
- *                             donde d_orig^2(q, x*) == LB_32_exact^2(q, x*) y x* se poda en PCA 32D).
+ * real c_p asignado por K-Means en ivf_idx, tanto sobre las proyecciones matematicas en double
+ * como sobre los residuos float32 efectivamente almacenados en ivf_idx.part_aos_vectors.
  */
 static void inject_and_verify_true_centroid_collinearity(BenchmarkDataset& ds,
                                                          const IVFPartitionedIndex& ivf_idx,
@@ -182,8 +222,6 @@ static void inject_and_verify_true_centroid_collinearity(BenchmarkDataset& ds,
             uint32_t p = (q + attempt) % P;
             const GeometricPartition& pm = ivf_idx.partitions[p];
             if (pm.count < 180) continue;
-            /* Recorrer desde el borde exterior de la particion (mayor radio) para que los vectores
-             * x* con q par tengan norma suficiente para superar r_K y ser podados en 5B */
             for (int64_t i = static_cast<int64_t>(pm.aos_offset + pm.count) - 1;
                  i >= static_cast<int64_t>(pm.aos_offset); --i) {
                 if (ivf_idx.part_aos_categories[i] < target_cat &&
@@ -201,35 +239,24 @@ static void inject_and_verify_true_centroid_collinearity(BenchmarkDataset& ds,
 
         const float* c_p = ivf_idx.centroids + static_cast<size_t>(chosen_p) * dim;
         const float* x_orig = ivf_idx.part_orig_vectors + static_cast<size_t>(chosen_pos) * dim;
+        const float* x_rot_stored_f32 = ivf_idx.part_aos_vectors + static_cast<size_t>(chosen_pos) * dim;
 
-        /* Calcular residuo rotado exacto de x* respecto de su centroide real c_p: x_rot = Q^T * (x - c_p) */
         double x_rot[64];
         double A2 = 0.0, B2 = 0.0, C2 = 0.0;
         for (uint32_t j = 0; j < dim; ++j) {
-            const float* row = ivf_idx.ortho_basis + static_cast<size_t>(j) * dim;
-            double acc = 0.0;
-            for (uint32_t d = 0; d < dim; ++d) {
-                acc += static_cast<double>(row[d]) * (static_cast<double>(x_orig[d]) - static_cast<double>(c_p[d]));
-            }
-            x_rot[j] = acc;
-            if (j < 16) A2 += acc * acc;
-            else if (j < 32) B2 += acc * acc;
-            else C2 += acc * acc;
+            x_rot[j] = static_cast<double>(x_rot_stored_f32[j]);
+            if (j < 16) A2 += x_rot[j] * x_rot[j];
+            else if (j < 32) B2 += x_rot[j] * x_rot[j];
+            else C2 += x_rot[j] * x_rot[j];
         }
 
         double q_rot_target[64];
         if (q < 15) {
-            /* Caso A (q in 0..14): Colinealidad completa 64D respecto del centroide real c_p.
-             * Para q par: alpha = 0.08 (q cerca de c_p donde r_K es pequeno y x* en el borde exterior
-             * de la particion cumple r_vec - dc_high > r_K, podandose en la etapa Radial con cos=1.0);
-             * para q impar: alpha = 0.98 (x* dentro de Top-K). */
             const double alpha = (q % 2 == 0) ? 0.08 : 0.98;
             for (uint32_t j = 0; j < dim; ++j) {
                 q_rot_target[j] = alpha * x_rot[j];
             }
         } else if (q < 35) {
-            /* Caso B (q in 15..34): ||q - c_p||_2 == ||x* - c_p||_2 (LB_radial == 0, NO poda en radial)
-             * y colinealidad exacta en 16..63: q_rot[16..63] = alpha * x_rot[16..63]. */
             if (q % 2 == 0) {
                 const double alpha = 0.35;
                 const double beta = std::sqrt((A2 + (1.0 - alpha * alpha) * (B2 + C2)) / A2);
@@ -243,9 +270,6 @@ static void inject_and_verify_true_centroid_collinearity(BenchmarkDataset& ds,
                 }
             }
         } else {
-            /* Caso C (q in 35..49): ||q - c_p||_2 == ||x* - c_p||_2 y ||q_rot[16..63]||_2 == ||x*_rot[16..63]||_2
-             * con q_rot[0..15] == x_rot[0..15] (LB_radial == 0 y LB_16 == 0, pasa a PCA 32D)
-             * y colinealidad exacta en 32..63: q_rot[32..63] = alpha * x_rot[32..63]. */
             if (q % 2 == 0) {
                 const double alpha = 0.35;
                 const double gamma = std::sqrt((B2 + (1.0 - alpha * alpha) * C2) / B2);
@@ -262,7 +286,6 @@ static void inject_and_verify_true_centroid_collinearity(BenchmarkDataset& ds,
             }
         }
 
-        /* Reconstruir q en el espacio original: q = c_p + Q * q_rot_target (donde Q = (Q^T)^T) */
         float* qv = ds.queries[q].values;
         for (uint32_t d = 0; d < dim; ++d) {
             double acc = static_cast<double>(c_p[d]);
@@ -273,8 +296,6 @@ static void inject_and_verify_true_centroid_collinearity(BenchmarkDataset& ds,
             qv[d] = static_cast<float>(acc);
         }
 
-        /* Verificar ahora sobre el vector qv float32 final que (qv - c_p) y (x_orig - c_p)
-         * cumplen colinealidad estricta respecto del centroide real c_p de la particion */
         double q_rot_actual[64];
         for (uint32_t j = 0; j < dim; ++j) {
             const float* row = ivf_idx.ortho_basis + static_cast<size_t>(j) * dim;
@@ -464,7 +485,7 @@ static void run_certification_suite(const char* suite_name,
                                               rank_matches_100[p], rank_totals_100[p], max_orig_dist_err[p]);
         }
 
-        /* Nivel 3: Auditar cada vector podado por Plan 5B en esta consulta (0 tolerancia) */
+        /* Nivel 3: Auditar cada vector podado por Plan 5B en las 5 etapas (0 tolerancia) */
         audit_plan5b_pruning_soundness(ivf_idx, qv, pred, k, gt, gt_cnt, audit);
     }
 
@@ -489,44 +510,59 @@ static void run_certification_suite(const char* suite_name,
         assert(max_orig_dist_err[i] == 0.0 && "Nivel 2 fallo: La distancia debe coincidir bit a bit en espacio original!");
     }
 
-    uint64_t total_pruned = audit.pruned_by_partition + audit.pruned_by_radial_shell
-                          + audit.pruned_by_pca_16d + audit.pruned_by_pca_32d;
-    printf("\n[Nivel 3 - Auditoria Directa de Poda en 5B (Cero Tolerancia: LB_safe^2 <= d_orig^2)]\n");
-    printf("  Elegibles auditados            : %llu\n", static_cast<unsigned long long>(audit.total_eligible_checked));
-    printf("  Podados por etapa              : Particion=%llu | Radial=%llu | PCA_16D=%llu | PCA_32D=%llu (Total=%llu)\n",
+    uint64_t total_pruned = audit.pruned_by_partition
+                          + audit.pruned_by_radial_shell
+                          + audit.pruned_by_pca_16d
+                          + audit.pruned_by_pca_32d
+                          + audit.pruned_by_pca_64d;
+    uint64_t total_accounted = total_pruned + audit.evaluated_full_64d;
+
+    printf("\n[Nivel 3 - Auditoria Exhaustiva de las 5 Etapas de Poda en 5B (Cero Tolerancia: LB_safe^2 <= d_orig^2)]\n");
+    printf("  Elegibles auditados            : %llu (Podados=%llu + EvaluadosOrig=%llu)\n",
+           static_cast<unsigned long long>(audit.total_eligible_checked),
+           static_cast<unsigned long long>(total_pruned),
+           static_cast<unsigned long long>(audit.evaluated_full_64d));
+    printf("  Podados por etapa              : Part=%llu | Radial=%llu | PCA16=%llu | PCA32=%llu | PCA64=%llu\n",
            static_cast<unsigned long long>(audit.pruned_by_partition),
            static_cast<unsigned long long>(audit.pruned_by_radial_shell),
            static_cast<unsigned long long>(audit.pruned_by_pca_16d),
            static_cast<unsigned long long>(audit.pruned_by_pca_32d),
-           static_cast<unsigned long long>(total_pruned));
-    printf("  Violaciones estrictas (Delta>0): Part=%llu | Radial=%llu | PCA16=%llu | PCA32=%llu\n",
+           static_cast<unsigned long long>(audit.pruned_by_pca_64d));
+    printf("  Violaciones estrictas (Delta>0): Part=%llu | Radial=%llu | PCA16=%llu | PCA32=%llu | PCA64=%llu\n",
            static_cast<unsigned long long>(audit.strict_violations_partition),
            static_cast<unsigned long long>(audit.strict_violations_radial),
            static_cast<unsigned long long>(audit.strict_violations_pca16),
-           static_cast<unsigned long long>(audit.strict_violations_pca32));
-    printf("  Eventos margen diag (0<D<=eps) : Part=%llu | Radial=%llu | PCA16=%llu | PCA32=%llu\n",
+           static_cast<unsigned long long>(audit.strict_violations_pca32),
+           static_cast<unsigned long long>(audit.strict_violations_pca64));
+    printf("  Eventos margen diag (0<D<=eps) : Part=%llu | Radial=%llu | PCA16=%llu | PCA32=%llu | PCA64=%llu\n",
            static_cast<unsigned long long>(audit.diag_margin_events_partition),
            static_cast<unsigned long long>(audit.diag_margin_events_radial),
            static_cast<unsigned long long>(audit.diag_margin_events_pca16),
-           static_cast<unsigned long long>(audit.diag_margin_events_pca32));
-    printf("  Violaciones > eps_diag         : Part=%llu | Radial=%llu | PCA16=%llu | PCA32=%llu\n",
+           static_cast<unsigned long long>(audit.diag_margin_events_pca32),
+           static_cast<unsigned long long>(audit.diag_margin_events_pca64));
+    printf("  Violaciones > eps_diag         : Part=%llu | Radial=%llu | PCA16=%llu | PCA32=%llu | PCA64=%llu\n",
            static_cast<unsigned long long>(audit.diag_exceed_violations_partition),
            static_cast<unsigned long long>(audit.diag_exceed_violations_radial),
            static_cast<unsigned long long>(audit.diag_exceed_violations_pca16),
-           static_cast<unsigned long long>(audit.diag_exceed_violations_pca32));
+           static_cast<unsigned long long>(audit.diag_exceed_violations_pca32),
+           static_cast<unsigned long long>(audit.diag_exceed_violations_pca64));
     printf("  Falsos descartes Top-K         : %llu\n", static_cast<unsigned long long>(audit.false_prunings_topk));
     printf("  Max exceso con signo (LB^2-d^2): %.6e (requerido <= 0.000000e+00)\n", audit.max_signed_excess);
     printf("  Max exceso positivo            : %.6e (requerido == 0.000000e+00)\n", audit.max_positive_excess);
     printf("  Min ratio d_orig^2 / LB_safe^2 : %.6f (requerido >= 1.000000)\n", audit.min_ratio_orig_over_lb);
 
+    assert(total_accounted == audit.total_eligible_checked &&
+           "Contabilidad incompleta: Podados(5 etapas) + EvaluadosOrig debe igualar total_eligible_checked!");
     assert(audit.strict_violations_partition == 0 && "Violacion estricta (LB_safe^2 > d_orig^2) en poda de particion!");
     assert(audit.strict_violations_radial == 0 && "Violacion estricta (LB_safe^2 > d_orig^2) en poda radial!");
     assert(audit.strict_violations_pca16 == 0 && "Violacion estricta (LB_safe^2 > d_orig^2) en poda PCA 16D!");
     assert(audit.strict_violations_pca32 == 0 && "Violacion estricta (LB_safe^2 > d_orig^2) en poda PCA 32D!");
+    assert(audit.strict_violations_pca64 == 0 && "Violacion estricta (LB_safe^2 > d_orig^2) en poda PCA 64D!");
     assert(audit.diag_margin_events_partition == 0 && "Evento en margen diagnostico en particion!");
     assert(audit.diag_margin_events_radial == 0 && "Evento en margen diagnostico en poda radial!");
     assert(audit.diag_margin_events_pca16 == 0 && "Evento en margen diagnostico en poda PCA 16D!");
     assert(audit.diag_margin_events_pca32 == 0 && "Evento en margen diagnostico en poda PCA 32D!");
+    assert(audit.diag_margin_events_pca64 == 0 && "Evento en margen diagnostico en poda PCA 64D!");
     assert(audit.max_positive_excess == 0.0 && "Se registro exceso positivo (LB_safe^2 > d_orig^2)!");
     assert(audit.max_signed_excess <= 0.0 && "El maximo exceso con signo debe ser <= 0.0!");
     assert(audit.min_ratio_orig_over_lb >= 1.0 && "El ratio minimo d_orig^2 / LB_safe^2 debe ser >= 1.0!");
@@ -535,21 +571,24 @@ static void run_certification_suite(const char* suite_name,
 
 int main() {
     std::cout << "================================================================================\n";
-    std::cout << "ALG-Flat 2.0 (Hito 2A.1): Certificacion Matematica sin Tolerancia Oculta\n";
-    std::cout << "  - Cotas IEEE-754 derivadas formalmente con factores gamma_n de Higham\n";
-    std::cout << "  - Nivel 1A: IDSetRecall con chequeo de no duplicados (0 tolerancia)\n";
-    std::cout << "  - Nivel 1B: RankMatch posicion a posicion (orden total dist_sq ASC, id ASC)\n";
-    std::cout << "  - Nivel 2 : Igualdad bit a bit de distancias en espacio original float32\n";
-    std::cout << "  - Nivel 3 : Exceso con signo Delta = LB_safe^2 - d_orig^2 <= 0.0 (0 tolerancia)\n";
+    std::cout << "ALG-Flat 2.0 (Hito 2A.2): Certificacion Exhaustiva de las 5 Etapas de Poda\n";
+    std::cout << "  - Redondeo dirigido conservador (round_up_f32 / round_down_f32 con nextafterf)\n";
+    std::cout << "  - Profundidades de redondeo separadas por etapa (16D:g17, 32D:g33, 64D:g67)\n";
+    std::cout << "  - Auditoria bit a bit de las 5 etapas: Particion, Radial, PCA16, PCA32 y PCA64\n";
+    std::cout << "  - Nivel 1A/1B: IDSetRecall (sin duplicados) + RankMatch posicion a posicion\n";
+    std::cout << "  - Nivel 3    : Exceso con signo Delta = LB_safe^2 - d_orig^2 <= 0.0 (0 tol)\n";
     std::cout << "================================================================================\n";
 
-    printf("Constantes IEEE-754 derivadas (u = 2^-24 = %.3e):\n", IEEE754_F32_U);
-    printf("  gamma_16 = %.3e | gamma_64 = %.3e | gamma_66 = %.3e\n",
-           static_cast<double>(GAMMA_16_F32), static_cast<double>(GAMMA_64_F32), static_cast<double>(GAMMA_66_F32));
-    printf("  ROT64_L2_COEFF_Q = %.3e | ROT64_L2_COEFF_C = %.3e | ROT64_L2_COEFF_X = %.3e\n",
-           static_cast<double>(ROT64_L2_COEFF_Q),
-           static_cast<double>(ROT64_L2_COEFF_C),
-           static_cast<double>(ROT64_L2_COEFF_X));
+    verify_directed_rounding_invariants();
+    printf("[OK] Invariantes de redondeo dirigido verificadas (round_up_f32 >= exact, round_down_f32 <= exact)\n");
+    printf("Constantes IEEE-754 derivadas (u_32 = 2^-24 = %.3e, u_64 = 2^-53 = %.3e):\n",
+           IEEE754_F32_U, IEEE754_F64_U);
+    printf("  gamma_17 = %.3e | gamma_33 = %.3e | gamma_64 = %.3e | gamma_66 = %.3e | gamma_67 = %.3e\n",
+           static_cast<double>(GAMMA_17_F32),
+           static_cast<double>(GAMMA_33_F32),
+           static_cast<double>(GAMMA_64_F32),
+           static_cast<double>(GAMMA_66_F32),
+           static_cast<double>(GAMMA_67_F32));
 
     /* Suite 1: Dataset completo de benchmark (N=100,000, M50/50, sigma=0.09, P=128) */
     {
@@ -580,7 +619,7 @@ int main() {
     }
 
     std::cout << "\n================================================================================\n";
-    std::cout << "CERTIFICACION HITO 2A.1 SUPERADA: 0 VIOLACIONES ESTRICTAS (Delta <= 0.0 EXACTO)\n";
+    std::cout << "CERTIFICACION HITO 2A.2 SUPERADA: 5 ETAPAS AUDITADAS, 0 VIOLACIONES ESTRICTAS\n";
     std::cout << "================================================================================\n";
     return 0;
 }

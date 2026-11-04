@@ -190,16 +190,16 @@ static int test_set_vectors_atomicity_on_failure() {
     return 0;
 }
 
-// 5. Arithmetic Overflow Unit Tests
-static int test_arithmetic_overflow_protection() {
+// 5. Dimension Bounds and Arithmetic Overflow Unit Tests
+static int test_dimension_bounds_and_arithmetic_overflow() {
     size_t result = 0;
 
-    // 2-way multiplication overflow
+    // Direct unit tests of arithmetic multiplication overflow protection on 64-bit boundaries
     TEST_ASSERT(alg_mul_overflow_2(SIZE_MAX / 2 + 1, 2, &result) == true, "Must detect 2-way overflow");
     TEST_ASSERT(alg_mul_overflow_2(SIZE_MAX, 2, &result) == true, "Must detect overflow with SIZE_MAX");
     TEST_ASSERT(alg_mul_overflow_2(1000, 2000, &result) == false && result == 2000000, "Valid 2-way multiplication must succeed");
 
-    // 3-way multiplication overflow
+    // 3-way multiplication overflow (e.g. num_vectors * dim * sizeof(float))
     TEST_ASSERT(alg_mul_overflow_3(SIZE_MAX / 4 + 1, 2, 2, &result) == true, "Must detect 3-way overflow");
     TEST_ASSERT(alg_mul_overflow_3(100, 200, 4, &result) == false && result == 80000, "Valid 3-way multiplication must succeed");
 
@@ -207,24 +207,24 @@ static int test_arithmetic_overflow_protection() {
     void* ptr = alg_aligned_alloc_64(SIZE_MAX - 10);
     TEST_ASSERT(ptr == nullptr, "Allocator must reject allocation exceeding SIZE_MAX - 63");
 
-    // alg_search_buffer bounds and overflow validation
+    // alg_search_buffer dimension bounds validation
     float dummy_q[64] = {0};
     float dummy_buf[64] = {0};
     AlgSearchResult res[5];
     uint32_t out_count = 999;
 
-    // Dimension > ALG_MAX_DIMENSION
-    AlgStatus st = alg_search_buffer(dummy_q, dummy_buf, nullptr, 1, ALG_MAX_DIMENSION + 1, 5,
+    // 1. Dimension exceeding maximum supported limit (> ALG_MAX_DIMENSION)
+    AlgStatus st = alg_search_buffer(dummy_q, dummy_buf, nullptr, 10, ALG_MAX_DIMENSION + 1, 5,
                                      ALG_SEARCH_FAST_FLOAT32, res, &out_count);
     TEST_ASSERT(st == ALG_INVALID_ARGUMENT, "alg_search_buffer with dimension > ALG_MAX_DIMENSION must fail");
     TEST_ASSERT(out_count == 0, "out_count must be reset to 0 on failure");
 
-    // Candidate count causing multiplication overflow
+    // 2. Dimension == 0 rejection
     out_count = 999;
-    st = alg_search_buffer(dummy_q, dummy_buf, nullptr, 0xFFFFFFFFu, 0xFFFFFFFFu, 5,
+    st = alg_search_buffer(dummy_q, dummy_buf, nullptr, 10, 0, 5,
                            ALG_SEARCH_FAST_FLOAT32, res, &out_count);
-    TEST_ASSERT(st == ALG_INVALID_ARGUMENT, "alg_search_buffer with overflowing count*dim must fail");
-    TEST_ASSERT(out_count == 0, "out_count must be reset to 0 on overflow");
+    TEST_ASSERT(st == ALG_INVALID_ARGUMENT, "alg_search_buffer with dimension 0 must fail");
+    TEST_ASSERT(out_count == 0, "out_count must be reset to 0 on failure");
 
     return 0;
 }
@@ -634,7 +634,7 @@ int main() {
     RUN_TEST(test_search_mode_contract);
     RUN_TEST(test_finiteness_validation_nan_inf);
     RUN_TEST(test_set_vectors_atomicity_on_failure);
-    RUN_TEST(test_arithmetic_overflow_protection);
+    RUN_TEST(test_dimension_bounds_and_arithmetic_overflow);
     RUN_TEST(test_simulated_oom_propagation);
     RUN_TEST(test_compact_search_strict_ids_and_out_of_bounds);
     RUN_TEST(test_topk_greater_than_512);

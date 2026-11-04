@@ -9,29 +9,31 @@ set(ALG_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
 include_directories("${ALG_SDK_DIR}/include")
 
-# Detect platform library directory
+# Detect platform library directory and resolve exact library archives
 if(WIN32)
     set(ALG_LIB_DIR "${ALG_SDK_DIR}/lib/windows-x64")
-    set(ALG_SHARED_NAME "alg")
-    set(ALG_STATIC_NAME "libalg")
+    find_library(ALG_STATIC_LIB NAMES libalg.a alg.lib
+        PATHS "${ALG_LIB_DIR}"
+        NO_DEFAULT_PATH
+        REQUIRED
+    )
+    find_library(ALG_SHARED_LIB NAMES alg.dll libalg_dll.a alg.lib
+        PATHS "${ALG_LIB_DIR}"
+        NO_DEFAULT_PATH
+    )
 else()
     set(ALG_LIB_DIR "${ALG_SDK_DIR}/lib/linux-x64")
-    set(ALG_SHARED_NAME "alg")
-    set(ALG_STATIC_NAME "alg")
+    # Enforce exact static archive name 'libalg.a' to avoid CMake resolving 'libalg.so'
+    find_library(ALG_STATIC_LIB NAMES libalg.a
+        PATHS "${ALG_LIB_DIR}"
+        NO_DEFAULT_PATH
+        REQUIRED
+    )
+    find_library(ALG_SHARED_LIB NAMES libalg.so alg
+        PATHS "${ALG_LIB_DIR}"
+        NO_DEFAULT_PATH
+    )
 endif()
-
-# Find static library
-find_library(ALG_STATIC_LIB NAMES ${ALG_STATIC_NAME} libalg alg
-    PATHS "${ALG_LIB_DIR}"
-    NO_DEFAULT_PATH
-    REQUIRED
-)
-
-# Find shared library / import library
-find_library(ALG_SHARED_LIB NAMES ${ALG_SHARED_NAME} libalg_dll alg
-    PATHS "${ALG_LIB_DIR}"
-    NO_DEFAULT_PATH
-)
 
 # 1. C Consumer Example (demonstrates dynamic linkage if available, otherwise static)
 add_executable(c_example c_example.c)
@@ -42,7 +44,7 @@ else()
     target_link_libraries(c_example PRIVATE ${ALG_STATIC_LIB})
 endif()
 
-# 2. C++ Consumer Example (demonstrates static linkage)
+# 2. C++ Consumer Example (strictly demonstrates static linkage)
 add_executable(cpp_example cpp_example.cpp)
 target_link_libraries(cpp_example PRIVATE ${ALG_STATIC_LIB})
 

@@ -5,7 +5,7 @@
 #include <string.h>
 #include <math.h>
 
-#define ALG_VERSION_STR "1.0.0-rc1"
+#define ALG_VERSION_STR "1.0.0"
 
 static inline bool alg_is_finite_buffer(const float* data, size_t count) {
     for (size_t i = 0; i < count; ++i) {

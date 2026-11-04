@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.0-rc1] - 2026-11-04
+## [1.0.0] - 2026-11-04
 
 ### Added
 - **Public C ABI** (`include/alg_engine.h`): Standard C99/C11 compatible header with opaque handle `AlgIndex`, explicit search modes, distance metrics, status codes, and configuration types.

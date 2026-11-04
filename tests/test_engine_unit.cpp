@@ -31,22 +31,30 @@
 
 // 1. Invalid Arguments & Out-Count Guarantee
 static int test_invalid_arguments_and_out_count() {
-    AlgIndex* index = nullptr;
-    AlgStatus status = alg_create_index(nullptr, &index);
+    // Verify out_index is set to NULL on any failure, even with stale pointer
+    AlgIndex* stale_index = (AlgIndex*)(uintptr_t)0xDEADBEEF;
+    AlgStatus status = alg_create_index(nullptr, &stale_index);
     TEST_ASSERT(status == ALG_INVALID_ARGUMENT, "NULL config must fail");
+    TEST_ASSERT(stale_index == nullptr, "out_index must be set to NULL on failure");
 
+    stale_index = (AlgIndex*)(uintptr_t)0xCAFEBABE;
     AlgIndexConfig cfg = {0, 100, ALG_METRIC_L2_SQR};
-    status = alg_create_index(&cfg, &index);
+    status = alg_create_index(&cfg, &stale_index);
     TEST_ASSERT(status == ALG_INVALID_ARGUMENT, "Dimension 0 must fail");
+    TEST_ASSERT(stale_index == nullptr, "out_index must be set to NULL on dimension 0");
 
     cfg.dimension = ALG_MAX_DIMENSION + 1;
-    status = alg_create_index(&cfg, &index);
+    stale_index = (AlgIndex*)(uintptr_t)0x12345678;
+    status = alg_create_index(&cfg, &stale_index);
     TEST_ASSERT(status == ALG_INVALID_ARGUMENT, "Dimension > ALG_MAX_DIMENSION must fail");
+    TEST_ASSERT(stale_index == nullptr, "out_index must be set to NULL on dimension overflow");
 
+    AlgIndex* index = nullptr;
     cfg.dimension = 64;
     cfg.metric = (AlgMetric)999;
     status = alg_create_index(&cfg, &index);
     TEST_ASSERT(status == ALG_INVALID_ARGUMENT, "Invalid metric must fail");
+    TEST_ASSERT(index == nullptr, "out_index must be NULL on invalid metric");
 
     // NULL index operations
     float q[64] = {0};
@@ -199,14 +207,24 @@ static int test_arithmetic_overflow_protection() {
     void* ptr = alg_aligned_alloc_64(SIZE_MAX - 10);
     TEST_ASSERT(ptr == nullptr, "Allocator must reject allocation exceeding SIZE_MAX - 63");
 
-    // Index creation overflow with initial_capacity * dim
-    AlgIndex* index = nullptr;
-    AlgIndexConfig cfg;
-    cfg.dimension = 100000;
-    cfg.initial_capacity = (uint32_t)(SIZE_MAX / (100000 * sizeof(float)) + 1);
-    cfg.metric = ALG_METRIC_L2_SQR;
-    AlgStatus st = alg_create_index(&cfg, &index);
-    TEST_ASSERT(st == ALG_INVALID_ARGUMENT || st == ALG_OUT_OF_MEMORY, "Index creation with overflowing size must fail");
+    // alg_search_buffer bounds and overflow validation
+    float dummy_q[64] = {0};
+    float dummy_buf[64] = {0};
+    AlgSearchResult res[5];
+    uint32_t out_count = 999;
+
+    // Dimension > ALG_MAX_DIMENSION
+    AlgStatus st = alg_search_buffer(dummy_q, dummy_buf, nullptr, 1, ALG_MAX_DIMENSION + 1, 5,
+                                     ALG_SEARCH_FAST_FLOAT32, res, &out_count);
+    TEST_ASSERT(st == ALG_INVALID_ARGUMENT, "alg_search_buffer with dimension > ALG_MAX_DIMENSION must fail");
+    TEST_ASSERT(out_count == 0, "out_count must be reset to 0 on failure");
+
+    // Candidate count causing multiplication overflow
+    out_count = 999;
+    st = alg_search_buffer(dummy_q, dummy_buf, nullptr, 0xFFFFFFFFu, 0xFFFFFFFFu, 5,
+                           ALG_SEARCH_FAST_FLOAT32, res, &out_count);
+    TEST_ASSERT(st == ALG_INVALID_ARGUMENT, "alg_search_buffer with overflowing count*dim must fail");
+    TEST_ASSERT(out_count == 0, "out_count must be reset to 0 on overflow");
 
     return 0;
 }

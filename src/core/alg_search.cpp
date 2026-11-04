@@ -202,7 +202,8 @@ AlgStatus alg_search_buffer(
     }
 
     // 2. Validate input pointers and arguments
-    if (!query_vector || !contiguous_vectors || !out_results || !out_count || top_k == 0 || dimension == 0) {
+    if (!query_vector || !contiguous_vectors || !out_results || !out_count || top_k == 0 ||
+        dimension == 0 || dimension > ALG_MAX_DIMENSION) {
         return ALG_INVALID_ARGUMENT;
     }
     if (search_mode != ALG_SEARCH_FAST_FLOAT32) {
@@ -218,9 +219,13 @@ AlgStatus alg_search_buffer(
         return ALG_OK;
     }
 
-    // Check size overflow on candidate_count * dimension
+    // Check size overflow on candidate_count * dimension (both element count and total bytes)
     size_t total_floats = 0;
-    if (alg_mul_overflow_2((size_t)candidate_count, dimension, &total_floats)) {
+    if (alg_mul_overflow_2((size_t)candidate_count, (size_t)dimension, &total_floats)) {
+        return ALG_INVALID_ARGUMENT;
+    }
+    size_t total_bytes = 0;
+    if (alg_mul_overflow_2(total_floats, sizeof(float), &total_bytes)) {
         return ALG_INVALID_ARGUMENT;
     }
 

@@ -21,7 +21,12 @@ static inline bool alg_is_finite_buffer(const float* data, size_t count) {
 }
 
 AlgStatus alg_create_index(const AlgIndexConfig* config, AlgIndex** out_index) {
-    if (!config || !out_index) {
+    if (!out_index) {
+        return ALG_INVALID_ARGUMENT;
+    }
+    *out_index = NULL;
+
+    if (!config) {
         return ALG_INVALID_ARGUMENT;
     }
     if (config->dimension == 0 || config->dimension > ALG_MAX_DIMENSION) {

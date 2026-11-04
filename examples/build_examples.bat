@@ -28,5 +28,9 @@ copy "%LIB_DIR%\alg.dll" bin\ >nul 2>&1
 
 echo.
 echo Standalone examples built successfully in bin/!
-echo Running c_example.exe...
+echo.
+echo [Execution 1/2] Running c_example.exe (Dynamic Linkage)...
 bin\c_example.exe
+echo.
+echo [Execution 2/2] Running cpp_example.exe (Static Linkage)...
+bin\cpp_example.exe

@@ -2,14 +2,11 @@
 #include "../../include/alg_engine.h"
 #include <atomic>
 
-#if defined(_MSC_VER) || defined(__INTEL_COMPILER) || defined(__clang__)
+#if defined(_MSC_VER) || defined(_WIN32)
 #include <immintrin.h>
-#if defined(_WIN32)
 #include <intrin.h>
-#endif
-#endif
-
-#if defined(__GNUC__) && !defined(_MSC_VER) && !defined(__clang__)
+#elif defined(__GNUC__) || defined(__clang__)
+#include <immintrin.h>
 #include <cpuid.h>
 #include <x86intrin.h>
 #endif

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Santiago Robledo.
+# SPDX-License-Identifier: Apache-2.0
 """Export real Hugging Face embedding rows into deterministic ALG Hito 3.3 files.
 
 Dependencies:
@@ -29,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", required=True, help="Hugging Face dataset ID")
     p.add_argument("--config", default=None, help="Dataset config/subset")
     p.add_argument("--split", default="train", help="HF split to load")
+    p.add_argument("--revision", required=True, help="Immutable Hugging Face dataset revision (commit SHA or tag)")
     p.add_argument("--vector-column", required=True, help="Column containing float embeddings")
     p.add_argument("--id-column", default=None)
     p.add_argument("--tenant-column", default=None)
@@ -90,7 +93,7 @@ def main() -> int:
         raise SystemExit("--dimensions accepts only 32,64,128,256")
 
     print(f"Loading {args.dataset} [{args.config or 'default'}] split={args.split} ...", flush=True)
-    ds = load_dataset(args.dataset, args.config, split=args.split)
+    ds = load_dataset(args.dataset, args.config, split=args.split, revision=args.revision)
     required_cols = [args.vector_column]
     for c in (args.id_column, args.tenant_column, args.category_column, args.timestamp_column):
         if c:

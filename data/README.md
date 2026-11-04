@@ -6,7 +6,7 @@ These data files are NOT part of the production library (`libalg`) and are NOT d
 
 ---
 
-## 1. Provenance and Immutable Dataset Reference
+## 1. Provenance and Reproducibility
 
 - **Source Dataset (Hugging Face):** [`lsb/simplewiki2023-all-minilm-l6-v2-embedding`](https://huggingface.co/datasets/lsb/simplewiki2023-all-minilm-l6-v2-embedding)
 - **Immutable Revision (Commit SHA):** `14270bcfcf2b7854cddce4395c0b38a199edef05`
@@ -15,6 +15,8 @@ These data files are NOT part of the production library (`libalg`) and are NOT d
   ```bash
   python benchmarks/realworld/prepare_hf_embeddings.py \
     --dataset lsb/simplewiki2023-all-minilm-l6-v2-embedding \
+    --revision 14270bcfcf2b7854cddce4395c0b38a199edef05 \
+    --vector-column embedding \
     --id-column id_int \
     --rows 100000 \
     --query-fraction 0.10 \
@@ -46,9 +48,9 @@ During export via `prepare_hf_embeddings.py`, **all natural language text, artic
 
 ---
 
-## 3. Git Tracking Policy and Cryptographic Manifests
+## 3. Git Tracking Policy and Cryptographic Fingerprints for Integrity Verification
 
-To keep the repository lightweight and avoid committing hundreds of megabytes of raw binary files, `.gitignore` excludes the data fixtures:
+To prevent repository bloat (avoiding committing hundreds of megabytes of raw floating-point arrays), `.gitignore` excludes the data fixtures:
 ```gitignore
 data/**/*.f32
 data/**/*.u32
@@ -56,34 +58,41 @@ data/**/*.jsonl
 !data/**/manifest.json
 ```
 
-The cryptographic proof and parameter configuration of the fixtures are preserved and committed to Git in the `manifest.json` files for each dimension.
+Instead of distributing large binaries, Git commits and tracks the `manifest.json` files for each dimension, recording cryptographic fingerprints to verify data integrity:
+- **Provenance:** Declares the immutable Hugging Face dataset revision (`14270bcfcf2b7854cddce4395c0b38a199edef05`), seed, and parameters.
+- **Integridad:** Allows independent verification that any locally generated or downloaded fixture matches the declared SHA-256 hashes, exact byte sizes, and row counts.
+- **Reproducibilidad:** Any user can re-execute `prepare_hf_embeddings.py` using the exact export command above to regenerate identical fixtures.
 
-### Dimensional Projection and Hash Inventory
+### Inventory of Hashes and Sizes
 
 The original 384-dimensional embeddings were projected to lower dimensional subspaces using `sklearn.decomposition.IncrementalPCA` (fitted strictly on the 90,000 corpus vectors, then applied to the 10,000 query vectors):
 
 #### Metadata Files (Common to all dimensions)
-- `corpus_metadata.jsonl`: `e57f05309281379e1aa23451eb23e72c1106f013928f23737e70865809713abb` (90,000 rows)
-- `query_metadata.jsonl`: `970864f989d133d8c32e3cf1c7c3cf3ba74fff079ef08a7cfcd0d5a48571bd31` (10,000 rows)
+- `corpus_metadata.jsonl`:
+  - SHA-256: `e57f05309281379e1aa23451eb23e72c1106f013928f23737e70865809713abb`
+  - Size: `7,883,700` bytes (90,000 rows)
+- `query_metadata.jsonl`:
+  - SHA-256: `970864f989d133d8c32e3cf1c7c3cf3ba74fff079ef08a7cfcd0d5a48571bd31`
+  - Size: `875,994` bytes (10,000 rows)
 
 #### Dimension D=32 (`data/hito3_3/D32/manifest.json`)
-- `corpus.f32`: `bbf7d152243c9c68f76cfa45374e718461c57e4a503da39534c7318713f382c8` (11,520,000 bytes, 90,000 rows)
-- `queries.f32`: `c03db0c4d27a17d9a10187c3d04858ed0130b71b6f6716ccc3148aa3a7d8f1f1` (1,280,000 bytes, 10,000 rows)
+- `corpus.f32`: `bbf7d152243c9c68f76cfa45374e718461c57e4a503da39534c7318713f382c8` (`11,520,000` bytes, 90,000 rows)
+- `queries.f32`: `c03db0c4d27a17d9a10187c3d04858ed0130b71b6f6716ccc3148aa3a7d8f1f1` (`1,280,000` bytes, 10,000 rows)
 - PCA Explained Variance Ratio: `39.76%`
 
 #### Dimension D=64 (`data/hito3_3/D64/manifest.json`)
-- `corpus.f32`: `f1f541f63bf6cacd82418edaa76b8e091e83f94ec574327794181665f9cabd6e` (23,040,000 bytes, 90,000 rows)
-- `queries.f32`: `56f49b15a7ae10fcf0087c77c8ca6bf5a60bde60842169004d91e383b36e89cd` (2,560,000 bytes, 10,000 rows)
+- `corpus.f32`: `f1f541f63bf6cacd82418edaa76b8e091e83f94ec574327794181665f9cabd6e` (`23,040,000` bytes, 90,000 rows)
+- `queries.f32`: `56f49b15a7ae10fcf0087c77c8ca6bf5a60bde60842169004d91e383b36e89cd` (`2,560,000` bytes, 10,000 rows)
 - PCA Explained Variance Ratio: `58.28%`
 
 #### Dimension D=128 (`data/hito3_3/D128/manifest.json`)
-- `corpus.f32`: `f7e5bd42c2e67bfad4e599ec4b2dddde0d23f0f9ed430ceda053343c8c6575c5` (46,080,000 bytes, 90,000 rows)
-- `queries.f32`: `ebccc78d1374ff02f0bb0d08b3a57c90c5377e28d34c1affd1c33b6340fa12cb` (5,120,000 bytes, 10,000 rows)
+- `corpus.f32`: `f7e5bd42c2e67bfad4e599ec4b2dddde0d23f0f9ed430ceda053343c8c6575c5` (`46,080,000` bytes, 90,000 rows)
+- `queries.f32`: `ebccc78d1374ff02f0bb0d08b3a57c90c5377e28d34c1affd1c33b6340fa12cb` (`5,120,000` bytes, 10,000 rows)
 - PCA Explained Variance Ratio: `79.61%`
 
 #### Dimension D=256 (`data/hito3_3/D256/manifest.json`)
-- `corpus.f32`: `074ea70b57b9dd584e1e989c997ba631e447365cd26d59de5324492922365fb9` (92,160,000 bytes, 90,000 rows)
-- `queries.f32`: `7737e59fec5eac448d0b3d527471dce9a1655f2f16d9b32e5f4f10969d887847` (10,240,000 bytes, 10,000 rows)
+- `corpus.f32`: `074ea70b57b9dd584e1e989c997ba631e447365cd26d59de5324492922365fb9` (`92,160,000` bytes, 90,000 rows)
+- `queries.f32`: `7737e59fec5eac448d0b3d527471dce9a1655f2f16d9b32e5f4f10969d887847` (`10,240,000` bytes, 10,000 rows)
 - PCA Explained Variance Ratio: `97.31%`
 
 ---

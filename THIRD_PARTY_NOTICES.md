@@ -61,6 +61,8 @@ SOFTWARE.
 ```bash
 python benchmarks/realworld/prepare_hf_embeddings.py \
   --dataset lsb/simplewiki2023-all-minilm-l6-v2-embedding \
+  --revision 14270bcfcf2b7854cddce4395c0b38a199edef05 \
+  --vector-column embedding \
   --id-column id_int \
   --rows 100000 \
   --query-fraction 0.10 \

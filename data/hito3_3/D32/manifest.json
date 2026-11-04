@@ -3,7 +3,7 @@
     "dataset":  "lsb/simplewiki2023-all-minilm-l6-v2-embedding",
     "dataset_commit":  "14270bcfcf2b7854cddce4395c0b38a199edef05",
     "dataset_download_timestamp":  "2026-11-03T16:05:00-03:00",
-    "export_command":  "python benchmarks/realworld/prepare_hf_embeddings.py --dataset lsb/simplewiki2023-all-minilm-l6-v2-embedding --id-column id_int --rows 100000 --query-fraction 0.10 --seed 3303 --dimensions 32,64,128,256 --output data/hito3_3",
+    "export_command":  "python benchmarks/realworld/prepare_hf_embeddings.py --dataset lsb/simplewiki2023-all-minilm-l6-v2-embedding --revision 14270bcfcf2b7854cddce4395c0b38a199edef05 --vector-column embedding --id-column id_int --rows 100000 --query-fraction 0.10 --seed 3303 --dimensions 32,64,128,256 --output data/hito3_3",
     "config":  null,
     "source_split":  "train",
     "source_vector_column":  "embedding",
@@ -36,17 +36,23 @@
     "files":  {
                   "corpus.f32":  {
                                      "sha256":  "bbf7d152243c9c68f76cfa45374e718461c57e4a503da39534c7318713f382c8",
-                                     "bytes":  11520000
+                                     "bytes":  11520000,
+                                     "rows":  90000
                                  },
                   "queries.f32":  {
                                       "sha256":  "c03db0c4d27a17d9a10187c3d04858ed0130b71b6f6716ccc3148aa3a7d8f1f1",
-                                      "bytes":  1280000
+                                      "bytes":  1280000,
+                                      "rows":  10000
                                   },
                   "corpus_metadata.jsonl":  {
-                                                "sha256":  "e57f05309281379e1aa23451eb23e72c1106f013928f23737e70865809713abb"
+                                                "sha256":  "e57f05309281379e1aa23451eb23e72c1106f013928f23737e70865809713abb",
+                                                "bytes":  7883700,
+                                                "rows":  90000
                                             },
                   "query_metadata.jsonl":  {
-                                               "sha256":  "970864f989d133d8c32e3cf1c7c3cf3ba74fff079ef08a7cfcd0d5a48571bd31"
+                                               "sha256":  "970864f989d133d8c32e3cf1c7c3cf3ba74fff079ef08a7cfcd0d5a48571bd31",
+                                               "bytes":  875994,
+                                               "rows":  10000
                                            }
               }
 }

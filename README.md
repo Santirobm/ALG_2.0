@@ -1,152 +1,173 @@
 # ALG Vector Engine
 
-**ALG Vector Engine** es una biblioteca de software independiente de alto rendimiento en C/C++ diseñada para la búsqueda vectorial filtrada exacta en espacios continuos (Euclidean Squared Distance, $L_2^2$).
+ALG Vector Engine es una biblioteca de software en C y C++ para busqueda vectorial exacta (k-NN) bajo distancia euclidea al cuadrado (L2). Esta disenada especificamente para entornos donde las consultas combinan filtros relacionales con similitud vectorial y se requiere maxima velocidad sin la complejidad de dependencias externas.
 
-El motor incorpora despacho dinámico de instrucciones en tiempo de ejecución (SIMD AVX2+FMA frente a fallback escalar portable) y almacenamiento contiguo alineado a 64 bytes (AoS), alcanzando rendimientos superiores a las implementaciones de escaneo vectorial estándar como FAISS Flat sin dependencias externas (cero dependencia de Python, NumPy o FAISS).
+La biblioteca detecta en tiempo de ejecucion el conjunto de instrucciones del procesador (SIMD AVX2 con FMA o fallback escalar portable), opera sobre memoria contigua alineada a 64 bytes y no depende de Python, BLAS, OpenMP ni frameworks pesados.
 
----
+## Problema que resuelve
 
-## 1. Arquitectura y Componentes del Sistema
+En sistemas modernos de busqueda semantica, recomendacion y analitica, la mayoria de las consultas no se ejecutan sobre el corpus completo, sino sobre subconjuntos filtrados por usuario, fecha, categoria, estado o atributos de negocio.
 
-El diseño de la biblioteca sigue una separación estricta de responsabilidades:
+Bajo estas condiciones:
+- Los indices aproximados basados en grafos (como HNSW) pierden eficiencia cuando los filtros reducen la cantidad de candidatos (por ejemplo, al 1% o 10%), debido a caminos desconectados en el grafo y accesos dispersos a memoria.
+- Las bibliotecas genericas orientadas a Python introducen sobrecarga de pasaje de datos, gestion de memoria y costo de despacho que superan el tiempo propio del calculo vectorial.
+
+ALG Vector Engine resuelve este escenario concentrandose en el calculo masivo y la seleccion Top-K sobre vectores continuos en memoria, ofreciendo tiempos de respuesta en el orden de microsegundos y una integracion nativa directa en cualquier lenguaje.
+
+## Caracteristicas principales
+
+- Interfaz C ABI pura: Cabecera C99 estable (alg_engine.h) compatible directamente con C, C++, Rust, Go, C# y llamadas FFI.
+- Despacho dinamico de instrucciones: Selecciona automaticamente el kernel AVX2+FMA o el camino escalar portable al iniciar, sin necesidad de compilar variantes binarias separadas.
+- Cero dependencias externas: Compila directamente con cualquier compilador C++14/C11 estandar (GCC, Clang, MSVC). No requiere OpenMP, MKL, BLAS ni dependencias de terceros.
+- Memoria contigua alineada: Los vectores se almacenan alineados a 64 bytes para aprovechar las lineas de cache L1/L2/L3 y los mecanismos de prefetch por hardware.
+- Seguridad y robustez: Validaciones de punteros nulos, limites de dimensiones, rechazo estricto de valores no finitos (NaN, Infinito) y proteccion aritmetica contra desbordamiento de enteros (overflow).
+- Concurrencia nativa: Los indices son de solo lectura durante la busqueda, permitiendo consultas simultaneas desde multiples hilos sin bloqueos ni contencion.
+- Multiplataforma: Soporte verificado para Windows x64 (MSVC, Clang/LLVM, MinGW) y Linux x64 (GCC, Clang).
+
+## Rendimiento
+
+Mediciones obtenidas con el arnes de pruebas incluido (tools/alg_benchmark_cli.cpp) sobre un procesador Intel Core i5-13500 con AVX2+FMA activado.
+
+Corpus: 100,000 vectores sinteticos, 200 consultas, Top-10:
+
+| Dimension | Selectividad | Candidatos evaluados | Latencia media (us) | p50 (us) | p95 (us) | QPS |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 64 | 1% | 1,000 | 4.58 | 4.40 | 6.20 | 218,293 |
+| 64 | 10% | 10,000 | 77.47 | 72.00 | 102.40 | 12,909 |
+| 64 | 100% | 100,000 | 913.48 | 715.20 | 1,543.60 | 1,095 |
+| 128 | 1% | 1,000 | 11.33 | 11.20 | 12.10 | 88,261 |
+| 128 | 10% | 10,000 | 134.47 | 129.10 | 160.70 | 7,437 |
+| 128 | 100% | 100,000 | 2,836.26 | 2,462.60 | 4,512.90 | 353 |
+| 256 | 1% | 1,000 | 24.57 | 24.60 | 25.10 | 40,703 |
+| 256 | 10% | 10,000 | 331.02 | 289.90 | 661.90 | 3,021 |
+| 256 | 100% | 100,000 | 5,662.05 | 5,388.10 | 7,019.70 | 177 |
+
+En conjuntos reducidos (1,000 a 10,000 vectores), las latencias inferiores a 100 microsegundos permiten realizar miles de consultas por segundo por nucleo sin saturar el sistema anfitrion.
+
+## Ejemplo de uso en C
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include "alg_engine.h"
+
+int main(void) {
+    const uint32_t dimension = 64;
+    const uint32_t num_vectors = 1000;
+    const uint32_t top_k = 5;
+
+    // 1. Configuracion y creacion del indice
+    AlgIndexConfig config = {
+        .dimension = dimension,
+        .initial_capacity = num_vectors,
+        .metric = ALG_METRIC_L2_SQR
+    };
+
+    AlgIndex* index = NULL;
+    if (alg_create_index(&config, &index) != ALG_OK) {
+        fprintf(stderr, "Error al crear el indice\n");
+        return 1;
+    }
+
+    // 2. Carga de vectores contiguos en memoria
+    float* corpus = (float*)malloc(num_vectors * dimension * sizeof(float));
+    // ... inicializar vectores ...
+    alg_set_vectors(index, num_vectors, corpus);
+
+    // 3. Busqueda filtrada sobre un subconjunto de candidatos elegibles
+    float query[64] = {0};
+    uint32_t eligible_ids[] = {10, 25, 42, 99, 150, 320};
+    uint32_t eligible_count = sizeof(eligible_ids) / sizeof(eligible_ids[0]);
+
+    AlgSearchResult results[5];
+    uint32_t result_count = 0;
+
+    AlgStatus status = alg_search_compact(
+        index,
+        query,
+        eligible_ids,
+        eligible_count,
+        top_k,
+        ALG_SEARCH_FAST_FLOAT32,
+        results,
+        &result_count
+    );
+
+    if (status == ALG_OK) {
+        for (uint32_t i = 0; i < result_count; ++i) {
+            printf("Rank %u: ID %u, Distancia L2^2: %f\n",
+                   i + 1, results[i].id, results[i].distance);
+        }
+    }
+
+    // 4. Liberacion de recursos
+    free(corpus);
+    alg_free_index(index);
+    return 0;
+}
+```
+
+## Ejemplo de uso en C++
+
+```cpp
+#include <iostream>
+#include <vector>
+#include "alg_engine.h"
+
+int main() {
+    const uint32_t dim = 128;
+    const uint32_t count = 5000;
+
+    AlgIndexConfig config = { dim, count, ALG_METRIC_L2_SQR };
+    AlgIndex* index = nullptr;
+    if (alg_create_index(&config, &index) != ALG_OK) {
+        return 1;
+    }
+
+    std::vector<float> data(count * dim, 0.5f);
+    alg_set_vectors(index, count, data.data());
+
+    std::vector<float> query(dim, 0.5f);
+    std::vector<AlgSearchResult> results(10);
+    uint32_t returned = 0;
+
+    if (alg_search(index, query.data(), 10, ALG_SEARCH_FAST_FLOAT32, results.data(), &returned) == ALG_OK) {
+        for (uint32_t i = 0; i < returned; ++i) {
+            std::cout << "Top " << (i + 1) << ": ID " << results[i].id
+                      << " (distancia: " << results[i].distance << ")\n";
+        }
+    }
+
+    alg_free_index(index);
+    return 0;
+}
+```
+
+## Estructura del repositorio
 
 ```
 ALG_2.0/
-├── include/
-│   └── alg_engine.h          # C ABI pública estable (manejadores opacos, enums, contratos)
-├── src/
-│   ├── platform/
-│   │   ├── cpu_features.h    # Detección de ISA en runtime vía CPUID/XGETBV (AVX2, FMA)
-│   │   ├── cpu_features.cpp
-│   │   ├── allocator.h       # Asignador de memoria contigua alineada a 64 bytes
-│   │   └── allocator.cpp
-│   ├── kernels/
-│   │   ├── kernels.h         # Punteros a funciones de kernel y tablas de despacho
-│   │   ├── simd_avx2.cpp     # Kernel AVX2+FMA 4x-unrolled (compilado con -mavx2 -mfma)
-│   │   └── simd_scalar.cpp   # Fallback escalar portable IEEE-754 (compilado con flags base)
-│   └── core/
-│       ├── alg_heap.h        # Bounded Max-Heap Top-K con desempate determinista por ID
-│       ├── alg_index.h       # Representación interna del índice y almacenamiento contiguo
-│       ├── alg_index.cpp     # Gestión del ciclo de vida y asignación del corpus
-│       ├── alg_search.h      # Declaraciones de algoritmos de búsqueda y orquestación
-│       └── alg_search.cpp    # Búsqueda filtrada (sparse/compact) y barrido completo
-├── examples/
-│   ├── c_example.c           # Ejemplo de integración en C puro
-│   └── cpp_example.cpp       # Ejemplo de integración en C++ moderno (wrapper RAII)
-├── tests/
-│   └── test_engine_unit.cpp  # Suite de verificación unitaria y regresión numérica
-├── tools/
-│   └── alg_benchmark_cli.cpp # Arnés de benchmarking CLI de latencia y throughput (QPS)
-├── CMakeLists.txt            # Configuración para CMake
-└── build.ps1                 # Script de compilación y ejecución directa en Windows (Zig Clang)
+|-- include/
+|   `-- alg_engine.h          Cabecera publica de la C ABI
+|-- src/
+|   |-- core/                 Gestion del indice, heap y logica de busqueda
+|   |-- kernels/              Kernels SIMD (AVX2+FMA) y fallback escalar
+|   `-- platform/             Deteccion de CPU y asignador alineado
+|-- examples/                 Ejemplos funcionales en C y C++ con scripts de compilacion
+|-- tests/                    Suite de 14 pruebas unitarias y de regresion numerica
+|-- tools/                    Herramienta de benchmark en linea de comandos
+|-- dist/                     Paquete de distribucion del SDK (binarios e interfaces)
+`-- CMakeLists.txt            Configuracion de compilacion del proyecto
 ```
 
-### Aislamiento de SIMD y Portabilidad
-- El núcleo (`core`) y la plataforma (`platform`) se compilan con la ISA base de la arquitectura destino.
-- El kernel optimizado de distancia 4x (`src/kernels/simd_avx2.cpp`) se encuentra aislado en una unidad de compilación dedicada que se compila con `-mavx2 -mfma`.
-- Durante la inicialización, la biblioteca ejecuta una comprobación CPUID (`alg_platform_detect_cpu_features`) y verifica que el sistema operativo gestione adecuadamente los registros YMM mediante `XGETBV`. Si el procesador anfitrión soporta AVX2 y FMA, se despachan los punteros vectorizados; de lo contrario, se conmuta transparentemente al kernel escalar portable.
+## Compilacion y pruebas
 
----
+### Requisitos
+- Compilador C++14 y C11: GCC 7+, Clang 6+ o MSVC 2017+
+- CMake 3.16 o superior (opcional si se compila con scripts directos)
 
-## 2. Contrato Numérico y Especificación de Ranking
+### Construccion con CMake (Linux y Windows)
 
-### 2.1 Modo `ALG_SEARCH_FAST_FLOAT32`
-1. **Cálculo de Distancia:**
-   - La distancia euclídea al cuadrado ($d^2(q, v) = \sum_{d=0}^{D-1} (q_d - v_d)^2$) se evalúa en precisión estándar IEEE 754 `float32`.
-   - En CPUs compatibles con AVX2, se evalúan simultáneamente 4 vectores candidatos mediante 4 acumuladores independientes `__m256`, reducidos al final a través de adiciones vectoriales horizontales.
-   - El orden de acumulación es fijo y determinista para cada dimensión.
-
-2. **Criterio de Ordenamiento Estricto:**
-   - **Clave Primaria:** Menor distancia cuadrática `float32` primero (orden ascendente).
-   - **Desempate Determinista:** En caso de igualdad exacta de distancias en float32 (diferencia de 0 ULP), el empate se resuelve de forma determinista favoreciendo al **menor identificador de vector (`id`)**.
-
-3. **Garantía y Precisión frente a `binary64`:**
-   - Debido a la no asociatividad de las operaciones en punto flotante a través de múltiples canales SIMD, la máquina $\epsilon_{\text{mach}}$ no constituye una cota de error universal que garantice equivalencia con el cálculo en doble precisión (`binary64`) para distribuciones arbitrarias sin una pasada explícita de intervalo de error.
-   - En auditorías exhaustivas sobre embeddings semánticos reales (**SimpleWiki MiniLM-L6-v2**, $D \in \{64, 128, 256\}$ con 9,000 consultas evaluadas), el motor certificó **100.0% de `IDSetRecall`** frente al oráculo `binary64`, confirmándose que las escasas discrepancias de orden estricto correspondieron a empates exactos de 0 ULP de bit o redondeos de 1 ULP adyacente.
-
-### 2.2 Modo `ALG_SEARCH_EXACT_TOPK`
-- Reservado para futuras extensiones que implementen refinamiento adaptativo por bandas de incertidumbre numérica. En la versión actual, retorna `ALG_INVALID_ARGUMENT`.
-
----
-
-## 3. Especificación de la C ABI Pública (`include/alg_engine.h`)
-
-La interfaz pública expone un contrato C99/C11 puro libre de símbolos decorados de C++:
-
-```c
-// Tipos de Estado y Retorno
-typedef enum AlgStatus {
-    ALG_OK                 = 0,
-    ALG_INVALID_ARGUMENT   = 1,
-    ALG_UNSUPPORTED_ISA    = 2,
-    ALG_OUT_OF_MEMORY      = 3,
-    ALG_NOT_INITIALIZED    = 4,
-    ALG_CAPACITY_EXCEEDED  = 5
-} AlgStatus;
-
-// Configuración del Índice
-typedef struct AlgIndexConfig {
-    uint32_t dimension;        // Dimensión de los vectores (D > 0)
-    uint32_t initial_capacity; // Capacidad inicial preasignada (0 para automático)
-    AlgMetric metric;          // Solo ALG_METRIC_L2_SQR
-} AlgIndexConfig;
-
-// Creación y Destrucción
-ALG_API AlgStatus alg_create_index(const AlgIndexConfig* config, AlgIndex** out_index);
-ALG_API void alg_free_index(AlgIndex* index);
-
-// Ingesta de Vectores
-ALG_API AlgStatus alg_set_vectors(AlgIndex* index, uint32_t num_vectors, const float* vectors);
-
-// Búsqueda Filtrada sobre Conjunto de Candidatos
-ALG_API AlgStatus alg_search_compact(
-    const AlgIndex* index,
-    const float* query_vector,
-    const uint32_t* eligible_ids,
-    uint32_t eligible_count,
-    uint32_t top_k,
-    AlgSearchMode search_mode,
-    AlgSearchResult* out_results,
-    uint32_t* out_count);
-
-// Búsqueda No Filtrada (100% Selectividad)
-ALG_API AlgStatus alg_search(
-    const AlgIndex* index,
-    const float* query_vector,
-    uint32_t top_k,
-    AlgSearchMode search_mode,
-    AlgSearchResult* out_results,
-    uint32_t* out_count);
-
-// Búsqueda sobre Buffer Externo Pre-Compactado
-ALG_API AlgStatus alg_search_buffer(
-    const float* query_vector,
-    const float* contiguous_vectors,
-    const uint32_t* candidate_ids,
-    uint32_t candidate_count,
-    uint32_t dimension,
-    uint32_t top_k,
-    AlgSearchMode search_mode,
-    AlgSearchResult* out_results,
-    uint32_t* out_count);
-```
-
----
-
-## 4. Compilación y Construcción
-
-### 4.1 Compilación Rápida con Zig C++ (Windows / PowerShell)
-El repositorio incluye el script de compilación directa [`build.ps1`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/build.ps1):
-
-```powershell
-# Compilar bibliotecas (libalg.a y alg.dll), ejecutar tests y construir ejemplos
-.\build.ps1
-
-# Ejecutar adicionalmente el benchmark CLI de rendimiento
-.\build.ps1 -RunBenchmark
-```
-
-### 4.2 Compilación con CMake (Linux / macOS / Windows)
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -154,40 +175,23 @@ cmake --build . --config Release
 ctest --output-on-failure
 ```
 
-Artefactos generados en `bin/` o `build/`:
-- `libalg.a` / `alg.lib`: Biblioteca estática.
-- `alg.dll` / `libalg.so`: Biblioteca dinámica compartida.
-- `test_engine_unit`: Ejecutable de pruebas de regresión.
-- `c_example`: Ejemplo de consumo en C.
-- `cpp_example`: Ejemplo de consumo en C++.
-- `alg_benchmark_cli`: Arnés de benchmarking independiente.
+### Construccion directa en Windows (PowerShell)
 
----
+```powershell
+.\build.ps1
+```
 
-## 5. Rendimiento y Resultados de Benchmarking
+El script genera las bibliotecas en bin/, compila y ejecuta los 14 tests unitarios, compila los ejemplos y empaqueta el SDK en dist/alg-vector-engine-sdk.
 
-Resultados reproducibles ejecutados con [`tools/alg_benchmark_cli.cpp`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/tools/alg_benchmark_cli.cpp) sobre procesador con AVX2+FMA (corpus $N = 100{,}000$ vectores, 200 consultas, Top-10):
+## Contenido del SDK empaquetado
 
-| Dimensión | Selectividad | Candidatos | Latencia Media (µs) | p50 (µs) | p95 (µs) | p99 (µs) | QPS |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **64** | 1% | 1,000 | **4.58** | 4.40 | 6.20 | 7.10 | **218,293** |
-| **64** | 10% | 10,000 | **77.47** | 72.00 | 102.40 | 128.20 | **12,909** |
-| **64** | 100% | 100,000 | **913.48** | 715.20 | 1,543.60 | 1,671.70 | **1,095** |
-| **128** | 1% | 1,000 | **11.33** | 11.20 | 12.10 | 13.40 | **88,261** |
-| **128** | 10% | 10,000 | **134.47** | 129.10 | 160.70 | 170.90 | **7,437** |
-| **128** | 100% | 100,000 | **2,836.26** | 2,462.60 | 4,512.90 | 7,402.70 | **353** |
-| **256** | 1% | 1,000 | **24.57** | 24.60 | 25.10 | 26.40 | **40,703** |
-| **256** | 10% | 10,000 | **331.02** | 289.90 | 661.90 | 812.20 | **3,021** |
-| **256** | 100% | 100,000 | **5,662.05** | 5,388.10 | 7,019.70 | 7,439.70 | **177** |
+El directorio dist/alg-vector-engine-sdk/ contiene los artefactos listos para su distribucion e integracion directa:
 
----
+- include/alg_engine.h: Cabecera C unica y autocontenida.
+- lib/windows-x64/: Biblioteca estatica (libalg.a), biblioteca dinamica (alg.dll) y libreria de importacion (libalg_dll.a).
+- lib/linux-x64/: Biblioteca estatica (libalg.a) y biblioteca compartida (libalg.so).
+- examples/: Ejemplos minimos en C y C++ con archivos CMakeLists.txt, build_examples.bat y build_examples.sh.
 
-## 6. Historial de Investigación
+## Licencia
 
-Las investigaciones exploratorias que fundamentaron la selección de la arquitectura actual se preservan en las ramas históricas del repositorio:
-- `main` / `hito2a`: Certificación de cotas geométricas y aritmética de intervalos IEEE-754.
-- `hito3.2-generalization-scalability`: Escalabilidad dimensional y distribuciones sintéticas.
-- `hito3.3-realworld-validation`: Evaluación sobre embeddings reales de SimpleWiki MiniLM-L6-v2.
-- `hito3.3.1-benchmark-integrity`: Descomposición de speedup y ablación de cuatro vías.
-- `hito3.3.2-kernel-isolation`: Experimento de decisión final de aislamiento de kernel (A1/A2/C1).
-- `product/alg-vector-engine`: **Línea activa de producción de la biblioteca independiente**.
+Distribuido bajo la licencia Apache 2.0. Consulte el archivo LICENSE para mas detalles.

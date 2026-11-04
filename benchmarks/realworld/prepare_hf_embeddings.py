@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -188,9 +189,25 @@ def main() -> int:
         write_jsonl(corpus_meta_path, corpus_meta)
         write_jsonl(query_meta_path, query_meta)
 
+        id_col_arg = f"--id-column {args.id_column} " if args.id_column else ""
+        export_cmd = (
+            f"python benchmarks/realworld/prepare_hf_embeddings.py "
+            f"--dataset {args.dataset} "
+            f"--revision {args.revision} "
+            f"--vector-column {args.vector_column} "
+            f"{id_col_arg}"
+            f"--rows {args.rows} "
+            f"--query-fraction {args.query_fraction:.2f} "
+            f"--seed {args.seed} "
+            f"--dimensions {','.join(str(x) for x in dims)} "
+            f"--output {args.output}"
+        )
         manifest = {
             "format": "ALG-HITO3.3-F32-ROWMAJOR-v1",
             "dataset": args.dataset,
+            "dataset_commit": args.revision,
+            "dataset_download_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "export_command": export_cmd,
             "config": args.config,
             "source_split": args.split,
             "source_vector_column": args.vector_column,
@@ -203,18 +220,36 @@ def main() -> int:
             "l2_normalized": not args.no_l2_normalize,
             "projection": projection,
             "metadata_columns": {
-                "id": args.id_column, "tenant": args.tenant_column,
-                "category": args.category_column, "timestamp": args.timestamp_column,
+                "id": args.id_column,
+                "tenant": args.tenant_column,
+                "category": args.category_column,
+                "timestamp": args.timestamp_column,
             },
             "metadata_completeness": {
                 key: sum(row[key] is not None for row in corpus_meta) / len(corpus_meta)
                 for key in ("tenant_id", "category", "timestamp")
             },
             "files": {
-                "corpus.f32": {"sha256": sha256_file(corpus_path), "bytes": corpus_path.stat().st_size},
-                "queries.f32": {"sha256": sha256_file(query_path), "bytes": query_path.stat().st_size},
-                "corpus_metadata.jsonl": {"sha256": sha256_file(corpus_meta_path)},
-                "query_metadata.jsonl": {"sha256": sha256_file(query_meta_path)},
+                "corpus.f32": {
+                    "sha256": sha256_file(corpus_path),
+                    "bytes": corpus_path.stat().st_size,
+                    "rows": int(len(corpus_d)),
+                },
+                "queries.f32": {
+                    "sha256": sha256_file(query_path),
+                    "bytes": query_path.stat().st_size,
+                    "rows": int(len(queries_d)),
+                },
+                "corpus_metadata.jsonl": {
+                    "sha256": sha256_file(corpus_meta_path),
+                    "bytes": corpus_meta_path.stat().st_size,
+                    "rows": len(corpus_meta),
+                },
+                "query_metadata.jsonl": {
+                    "sha256": sha256_file(query_meta_path),
+                    "bytes": query_meta_path.stat().st_size,
+                    "rows": len(query_meta),
+                },
             },
         }
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",

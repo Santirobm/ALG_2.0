@@ -11,8 +11,10 @@ These data files are NOT part of the production library (`libalg`) and are NOT d
 - **Source Dataset (Hugging Face):** [`lsb/simplewiki2023-all-minilm-l6-v2-embedding`](https://huggingface.co/datasets/lsb/simplewiki2023-all-minilm-l6-v2-embedding)
 - **Immutable Revision (Commit SHA):** `14270bcfcf2b7854cddce4395c0b38a199edef05`
 - **Download and Ingestion Timestamp:** `2026-11-03T16:05:00-03:00`
+- **Locked Dependencies:** [`benchmarks/realworld/requirements-lock.txt`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/benchmarks/realworld/requirements-lock.txt)
 - **Reproducible Export Command:**
   ```bash
+  pip install -r benchmarks/realworld/requirements-lock.txt
   python benchmarks/realworld/prepare_hf_embeddings.py \
     --dataset lsb/simplewiki2023-all-minilm-l6-v2-embedding \
     --revision 14270bcfcf2b7854cddce4395c0b38a199edef05 \
@@ -107,3 +109,18 @@ The exported fixtures do not contain source article text, titles, or URLs. They 
    The embeddings were calculated upstream using `sentence-transformers/all-MiniLM-L6-v2`, distributed under the **Apache License 2.0** by Nils Reimers and contributors.
 3. **Derived Float32 Vector Arrays:**  
    The `.f32` files are numerical mathematical transformations (projections) generated strictly as benchmarking test fixtures to measure search recall and latency. They are independent of the core library code and carry no proprietary encumbrance affecting the commercial acquisition or licensing of ALG Vector Engine.
+
+---
+
+## 5. Reproducibility Levels and End-to-End Regeneration Audit
+
+To provide complete clarity to external auditors and integrators, the reproducibility of the evaluation fixtures is certified across three distinct levels:
+
+- **Level 1 — Origin Reproducibility:**  
+  The exact snapshot of the data is pinned to Hugging Face commit `14270bcfcf2b7854cddce4395c0b38a199edef05` (split `train`, first 100,000 rows, random seed `3303`, query fraction `0.10`).
+- **Level 2 — Methodological Reproducibility:**  
+  The software environment and dependency versions are pinned in [`benchmarks/realworld/requirements-lock.txt`](file:///c:/Users/sgi.lm/Desktop/BTC/ALG_2.0/benchmarks/realworld/requirements-lock.txt) (Python `3.13.5`, `datasets==4.8.5`, `numpy==2.3.2`, `scikit-learn==1.9.1`, `scipy==1.17.1`).
+- **Level 3 — Binary Reproducibility (Audited in Clean Directory):**  
+  An independent regeneration test was conducted using the published command targeting an isolated directory (`data/test_regen`). All 16 generated files across all four dimensions (corpus vectors, query vectors, and metadata files) were compared against the original fixtures:
+  - **Match rate:** 16 / 16 files (100.0%) matched bit-for-bit with identical SHA-256 hashes and byte lengths.
+  - **Floating-point stability:** Confirmed that `IncrementalPCA` projection and L2-normalization produce zero floating-point divergence under the pinned environment.

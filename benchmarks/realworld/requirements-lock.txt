@@ -1,0 +1,16 @@
+# Pinned Python dependencies for deterministic reproduction of ALG benchmark fixtures
+# Python runtime version: 3.13.5 (x86_64 on Windows 10/11)
+
+datasets==4.8.5
+dill==0.4.1
+fsspec==2026.2.0
+huggingface-hub==1.33.0
+joblib==1.6.0
+multiprocess==0.70.19
+numpy==2.3.2
+packaging==25.0
+pyarrow==26.0.1
+scikit-learn==1.9.1
+scipy==1.17.1
+threadpoolctl==3.7.0
+xxhash==4.0.2

@@ -1,4 +1,6 @@
 # Binaries and build artifacts
+bin/
+build/
 *.exe
 *.pdb
 *.obj

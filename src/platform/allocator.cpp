@@ -1,0 +1,49 @@
+#include "allocator.h"
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
+void* alg_aligned_alloc_64(size_t bytes) {
+    if (bytes == 0) bytes = 64;
+    size_t padded = (bytes + 63) & ~size_t(63);
+
+#if defined(_WIN32)
+    void* ptr = _aligned_malloc(padded, 64);
+#elif defined(_ISOC11_SOURCE) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
+    void* ptr = aligned_alloc(64, padded);
+#elif defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+    void* ptr = NULL;
+    if (posix_memalign(&ptr, 64, padded) != 0) {
+        ptr = NULL;
+    }
+#else
+    // Fallback using manual padding
+    void* raw = malloc(padded + 64 + sizeof(void*));
+    if (!raw) return NULL;
+    void** ptr = (void**)(((size_t)raw + sizeof(void*) + 63) & ~size_t(63));
+    ptr[-1] = raw;
+    memset(ptr, 0, padded);
+    return (void*)ptr;
+#endif
+
+    if (ptr) {
+        memset(ptr, 0, padded);
+    }
+    return ptr;
+}
+
+void alg_aligned_free_64(void* ptr) {
+    if (!ptr) return;
+
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#elif defined(_ISOC11_SOURCE) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L) || (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L)
+    free(ptr);
+#else
+    void** p = (void**)ptr;
+    free(p[-1]);
+#endif
+}

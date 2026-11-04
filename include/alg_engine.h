@@ -20,6 +20,11 @@
  *      ground truth across arbitrary distributions without an explicit error bound pass.
  *      Exhaustive audit on real-world SimpleWiki MiniLM-L6-v2 embeddings (D in {64, 128, 256})
  *      confirmed 100.0% IDSetRecall across 9,000 queries.
+ *    - Finiteness policy: Non-finite inputs (NaN, +Inf, -Inf) are strictly prohibited in
+ *      corpus vectors and query vectors. Any non-finite value is explicitly rejected with
+ *      ALG_INVALID_ARGUMENT, leaving existing index state completely unmodified.
+ *    - Error guarantee: On any error, *out_count is guaranteed to be set to 0 and no partial
+ *      results are presented as valid.
  *
  * 2. Mode ALG_SEARCH_EXACT_TOPK:
  *    - Reserved for future multi-pass uncertainty-band refinement.
@@ -57,9 +62,9 @@ extern "C" {
  */
 typedef enum AlgStatus {
     ALG_OK                 = 0,  /**< Operation completed successfully */
-    ALG_INVALID_ARGUMENT   = 1,  /**< An invalid argument was provided (e.g. NULL pointer, dim=0, invalid mode) */
+    ALG_INVALID_ARGUMENT   = 1,  /**< An invalid argument was provided (e.g. NULL pointer, dim=0, NaN/Inf, invalid mode) */
     ALG_UNSUPPORTED_ISA    = 2,  /**< Requested ISA feature is unsupported by host CPU */
-    ALG_OUT_OF_MEMORY      = 3,  /**< Memory allocation failed */
+    ALG_OUT_OF_MEMORY      = 3,  /**< Memory allocation failed (or size calculation overflowed) */
     ALG_NOT_INITIALIZED    = 4,  /**< Index or component is not initialized */
     ALG_CAPACITY_EXCEEDED  = 5   /**< Target exceeds configured capacity */
 } AlgStatus;
@@ -131,6 +136,9 @@ ALG_API void alg_free_index(AlgIndex* index);
  * Vectors are copied into 64-byte aligned internal memory.
  * Vector IDs are implicitly assigned sequentially in range [0, num_vectors - 1].
  *
+ * Atomicity guarantee: If validation fails (e.g. non-finite values or allocation error),
+ * the existing index state and corpus remain completely intact and unmodified.
+ *
  * @param index Pointer to index handle.
  * @param num_vectors Number of vectors in the corpus.
  * @param vectors Contiguous row-major float32 array of shape (num_vectors, dimension).
@@ -141,9 +149,12 @@ ALG_API AlgStatus alg_set_vectors(AlgIndex* index, uint32_t num_vectors, const f
 /**
  * Query the index over a filtered list of candidate vector IDs.
  *
+ * Robustness guarantee: If out_count is non-NULL, *out_count is set to 0 immediately
+ * upon entry and remains 0 on any error.
+ *
  * @param index Pointer to index handle.
- * @param query_vector Query vector of size 'dimension'.
- * @param eligible_ids Array of eligible candidate vector IDs.
+ * @param query_vector Query vector of size 'dimension' (must contain finite values).
+ * @param eligible_ids Required array of eligible candidate vector IDs (must NOT be NULL).
  * @param eligible_count Number of candidate IDs in eligible_ids.
  * @param top_k Maximum number of nearest neighbors to retrieve.
  * @param search_mode Search evaluation mode (must be ALG_SEARCH_FAST_FLOAT32).
@@ -164,8 +175,11 @@ ALG_API AlgStatus alg_search_compact(
 /**
  * Query the entire corpus without filtering (100% selectivity).
  *
+ * Robustness guarantee: If out_count is non-NULL, *out_count is set to 0 immediately
+ * upon entry and remains 0 on any error.
+ *
  * @param index Pointer to index handle.
- * @param query_vector Query vector of size 'dimension'.
+ * @param query_vector Query vector of size 'dimension' (must contain finite values).
  * @param top_k Maximum number of nearest neighbors to retrieve.
  * @param search_mode Search evaluation mode (must be ALG_SEARCH_FAST_FLOAT32).
  * @param out_results User-allocated buffer of at least top_k AlgSearchResult items.
@@ -184,10 +198,13 @@ ALG_API AlgStatus alg_search(
  * Directly compute Top-K nearest neighbors over an external contiguous buffer of vectors.
  * Useful for scenarios where candidates have already been gathered into a contiguous memory block.
  *
- * @param query_vector Query vector of size 'dimension'.
+ * Robustness guarantee: If out_count is non-NULL, *out_count is set to 0 immediately
+ * upon entry and remains 0 on any error.
+ *
+ * @param query_vector Query vector of size 'dimension' (must contain finite values).
  * @param contiguous_vectors Contiguous row-major float32 array of shape (candidate_count, dimension).
  * @param candidate_ids Optional array of original vector IDs (length candidate_count).
- *                      If NULL, IDs 0 .. candidate_count - 1 are used.
+ *                      If NULL, local IDs 0 .. candidate_count - 1 are used.
  * @param candidate_count Number of vectors in contiguous_vectors.
  * @param dimension Vector dimension.
  * @param top_k Maximum number of nearest neighbors to retrieve.
@@ -231,6 +248,12 @@ ALG_API const char* alg_get_active_isa_name(void);
  * Return library version string.
  */
 ALG_API const char* alg_get_version(void);
+
+/**
+ * Debug / Testing API: Force the engine to use scalar fallback even on CPUs with AVX2.
+ * Pass 1 to force scalar fallback, or 0 to restore automatic ISA detection.
+ */
+ALG_API void alg_debug_force_scalar_isa(int force);
 
 #ifdef __cplusplus
 }

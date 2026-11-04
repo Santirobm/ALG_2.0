@@ -58,9 +58,9 @@ Write-Host "[4/6] Linking shared library bin/alg.dll..." -ForegroundColor Yellow
 Write-Host "[5/6] Building test suite..." -ForegroundColor Yellow
 & $ZIG c++ -O3 -std=c++17 $Inc tests/test_engine_unit.cpp "$BinDir/libalg.a" -o "$BinDir/test_engine_unit.exe"
 
-# 6. Build examples & benchmark CLI
+# 6. Build examples & benchmark CLI (testing both static and DLL linkage)
 Write-Host "[6/6] Building examples and benchmark CLI..." -ForegroundColor Yellow
-& $ZIG cc -O3 -std=c11 $Inc examples/c_example.c "$BinDir/libalg.a" -o "$BinDir/c_example.exe"
+& $ZIG cc -O3 -std=c11 $Inc examples/c_example.c "$BinDir/libalg_dll.a" -o "$BinDir/c_example.exe"
 & $ZIG c++ -O3 -std=c++17 $Inc examples/cpp_example.cpp "$BinDir/libalg.a" -o "$BinDir/cpp_example.exe"
 & $ZIG c++ -O3 -std=c++17 $Inc tools/alg_benchmark_cli.cpp "$BinDir/libalg.a" -o "$BinDir/alg_benchmark_cli.exe"
 

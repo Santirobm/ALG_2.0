@@ -34,7 +34,11 @@ typedef struct AlgTopKHeap {
     bool is_dynamic;
 } AlgTopKHeap;
 
-static inline void alg_heap_init(AlgTopKHeap* heap, uint32_t target_k) {
+static inline AlgStatus alg_heap_init(AlgTopKHeap* heap, uint32_t target_k) {
+    if (!heap || target_k == 0) {
+        return ALG_INVALID_ARGUMENT;
+    }
+
     heap->size = 0;
     heap->k = target_k;
     heap->threshold = FLT_MAX;
@@ -43,15 +47,26 @@ static inline void alg_heap_init(AlgTopKHeap* heap, uint32_t target_k) {
     if (target_k <= ALG_HEAP_INLINE_CAPACITY) {
         heap->data = heap->inline_buffer;
     } else {
-        heap->data = (AlgSearchResult*)malloc(target_k * sizeof(AlgSearchResult));
+        // Overflow check on allocation size
+        if ((size_t)target_k > SIZE_MAX / sizeof(AlgSearchResult)) {
+            heap->data = NULL;
+            return ALG_OUT_OF_MEMORY;
+        }
+        heap->data = (AlgSearchResult*)malloc((size_t)target_k * sizeof(AlgSearchResult));
+        if (!heap->data) {
+            return ALG_OUT_OF_MEMORY;
+        }
         heap->is_dynamic = true;
     }
+
+    return ALG_OK;
 }
 
 static inline void alg_heap_free(AlgTopKHeap* heap) {
-    if (heap->is_dynamic && heap->data) {
+    if (heap && heap->is_dynamic && heap->data) {
         free(heap->data);
         heap->data = NULL;
+        heap->is_dynamic = false;
     }
 }
 

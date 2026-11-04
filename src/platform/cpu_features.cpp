@@ -1,5 +1,6 @@
 #include "cpu_features.h"
 #include "../../include/alg_engine.h"
+#include <atomic>
 
 #if defined(_MSC_VER) || defined(__INTEL_COMPILER) || defined(__clang__)
 #include <immintrin.h>
@@ -12,6 +13,9 @@
 #include <cpuid.h>
 #include <x86intrin.h>
 #endif
+
+static std::atomic<uint32_t> g_cached_features{0xFFFFFFFFu};
+static std::atomic<bool> g_force_scalar{false};
 
 static inline void run_cpuid(int cpu_info[4], int func_id, int subfunc_id) {
 #if defined(_MSC_VER) || defined(_WIN32)
@@ -35,12 +39,7 @@ static inline uint64_t run_xgetbv(uint32_t xcr) {
 #endif
 }
 
-uint32_t alg_platform_detect_cpu_features(void) {
-    static uint32_t cached_features = 0xFFFFFFFF;
-    if (cached_features != 0xFFFFFFFF) {
-        return cached_features;
-    }
-
+static uint32_t detect_features_internal(void) {
     uint32_t features = ALG_CPU_FEATURE_NONE;
     int info[4] = {0};
 
@@ -48,26 +47,22 @@ uint32_t alg_platform_detect_cpu_features(void) {
     run_cpuid(info, 0, 0);
     int max_func = info[0];
     if (max_func < 1) {
-        cached_features = features;
         return features;
     }
 
-    // Function 1: ECX has OSXSAVE (bit 27) and FMA (bit 12)
+    // Function 1: ECX has OSXSAVE (bit 27), FMA (bit 12), AVX (bit 28)
     run_cpuid(info, 1, 0);
     bool osxsave = (info[2] & (1 << 27)) != 0;
     bool fma     = (info[2] & (1 << 12)) != 0;
     bool avx     = (info[2] & (1 << 28)) != 0;
 
     if (!osxsave || !avx) {
-        cached_features = features;
         return features;
     }
 
     // Check XGETBV to verify OS supports saving YMM state (XMM bit 1, YMM bit 2)
     uint64_t xcr0 = run_xgetbv(0);
     if ((xcr0 & 0x6) != 0x6) {
-        // OS does not manage YMM registers
-        cached_features = features;
         return features;
     }
 
@@ -84,16 +79,35 @@ uint32_t alg_platform_detect_cpu_features(void) {
         }
     }
 
-    cached_features = features;
     return features;
 }
 
+uint32_t alg_platform_detect_cpu_features(void) {
+    // Thread-safe lock-free double-checked acquire/release
+    uint32_t cached = g_cached_features.load(std::memory_order_acquire);
+    if (cached == 0xFFFFFFFFu) {
+        uint32_t detected = detect_features_internal();
+        g_cached_features.store(detected, std::memory_order_release);
+        cached = detected;
+    }
+    if (g_force_scalar.load(std::memory_order_relaxed)) {
+        return ALG_CPU_FEATURE_NONE;
+    }
+    return cached;
+}
+
 bool alg_platform_has_avx2(void) {
+    if (g_force_scalar.load(std::memory_order_relaxed)) {
+        return false;
+    }
     uint32_t feat = alg_platform_detect_cpu_features();
     return (feat & ALG_CPU_FEATURE_AVX2) && (feat & ALG_CPU_FEATURE_FMA);
 }
 
 bool alg_platform_has_fma(void) {
+    if (g_force_scalar.load(std::memory_order_relaxed)) {
+        return false;
+    }
     uint32_t feat = alg_platform_detect_cpu_features();
     return (feat & ALG_CPU_FEATURE_FMA) != 0;
 }
@@ -103,4 +117,12 @@ const char* alg_platform_get_isa_string(void) {
         return "AVX2+FMA (Vectorized 4x-unrolled)";
     }
     return "Scalar Fallback (IEEE 754 float32)";
+}
+
+void alg_platform_set_force_scalar(bool force) {
+    g_force_scalar.store(force, std::memory_order_seq_cst);
+}
+
+void alg_debug_force_scalar_isa(int force) {
+    alg_platform_set_force_scalar(force != 0);
 }

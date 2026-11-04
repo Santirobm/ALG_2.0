@@ -8,6 +8,12 @@
 
 void* alg_aligned_alloc_64(size_t bytes) {
     if (bytes == 0) bytes = 64;
+
+    // Arithmetic overflow protection on bytes + 63
+    if (bytes > (SIZE_MAX - 63)) {
+        return NULL;
+    }
+
     size_t padded = (bytes + 63) & ~size_t(63);
 
 #if defined(_WIN32)
@@ -21,6 +27,9 @@ void* alg_aligned_alloc_64(size_t bytes) {
     }
 #else
     // Fallback using manual padding
+    if (padded > (SIZE_MAX - 64 - sizeof(void*))) {
+        return NULL;
+    }
     void* raw = malloc(padded + 64 + sizeof(void*));
     if (!raw) return NULL;
     void** ptr = (void**)(((size_t)raw + sizeof(void*) + 63) & ~size_t(63));

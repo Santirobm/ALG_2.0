@@ -9,15 +9,19 @@ The standalone core library (`libalg`) does not link against, include, or depend
 ## 1. FAISS (Facebook AI Similarity Search)
 
 - Directory: `third_party/faiss/`
+- Documentation: `third_party/faiss/README.md`
 - Upstream Repository: https://github.com/facebookresearch/faiss
-- Version: 1.15.1 (defined by `FAISS_VERSION_MAJOR 1`, `MINOR 15`, `PATCH 1` in `include/faiss/Index.h`)
-- License: MIT License
+- Release Tag: [`v1.15.1`](https://github.com/facebookresearch/faiss/releases/tag/v1.15.1) (Release date: September 15, 2026)
+- Upstream Commit Hash: `3bb4864b2260683416a49db21ebcb66b0a94464c`
+- License: MIT License (Meta Platforms, Inc. and affiliates)
 - Purpose: Benchmarking, comparative baseline measurements, and numerical equivalence verification in `benchmarks/faiss_comparison/` and `tests/`.
 
 ### Binary Provenance (`faiss.lib`)
-- The file `third_party/faiss/faiss.lib` is a 64-bit Windows import library (stub) generated from `third_party/faiss/faiss.def` using the MSVC library manager (`lib.exe /def:faiss.def /machine:x64 /out:faiss.lib`).
-- It contains symbol export references for linking benchmark executables against an external dynamic `faiss.dll` runtime on Windows.
-- It is NOT included in or linked by the distributed SDK (`dist/alg-vector-engine-sdk`).
+- `third_party/faiss/faiss.def`: Module definition file containing 8,138 exported symbols for Windows x64.
+  - SHA-256: `E9437311BDD3640A155A7AE3C3C2EA492FA9EDF0AEFD02AEE51D4578C380ECB8`
+- `third_party/faiss/faiss.lib`: Windows x64 MSVC import library generated from `faiss.def` using `lib.exe /nologo /def:faiss.def /machine:x64 /out:faiss.lib` (Microsoft (R) Library Manager Version 14.12.25835.0).
+  - SHA-256: `A089148BC1294A2B78DCA4DEA5B7266C1198E4E6AAB3DC644EAB28883607EE12`
+- Role: Resolves external calls against an external dynamic `faiss.dll` runtime during benchmark runs on Windows x64. It is NOT linked by or distributed with the production SDK (`dist/alg-vector-engine-sdk`).
 
 ### MIT License Text
 
@@ -46,22 +50,13 @@ SOFTWARE.
 ## 2. Evaluation Datasets and Embeddings
 
 - Directory: `data/`
-- Detailed documentation: `data/README.md`
+- Detailed documentation and hash inventory: `data/README.md`
+- Source Dataset (Hugging Face): [`lsb/simplewiki2023-all-minilm-l6-v2-embedding`](https://huggingface.co/datasets/lsb/simplewiki2023-all-minilm-l6-v2-embedding)
+- Immutable Revision (Commit SHA): `14270bcfcf2b7854cddce4395c0b38a199edef05`
+- Download Timestamp: `2026-11-03T16:05:00-03:00`
 - Purpose: Real-world vector distribution validation across research and historical ablation benchmarks (Milestones 3.2 and 3.3).
 
-The evaluation fixtures separate into three components with distinct licensing terms:
-
-### A. Original Source Text (Simple English Wikipedia)
-- Content: Article titles and text from Simple English Wikipedia dump (2023).
-- License: Creative Commons Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0) and GNU Free Documentation License (GFDL).
-- Copyright: Wikimedia Foundation and individual Wikipedia contributors.
-
-### B. Embedding Model (sentence-transformers/all-MiniLM-L6-v2)
-- Upstream: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
-- Authors: Nils Reimers and Sentence-Transformers contributors.
-- License: Apache License, Version 2.0.
-
-### C. Derived Embeddings and PCA Projections (`data/hito3_3/`)
-- Generation: 384-dimensional embeddings sourced from `lsb/simplewiki2023-all-minilm-l6-v2-embedding`, projected to dimensions 32, 64, 128, and 256 using `IncrementalPCA` via `benchmarks/realworld/prepare_hf_embeddings.py`.
-- Status: Binary test fixtures (`corpus.f32`, `queries.f32`) and JSONL metadata used exclusively for offline accuracy and latency testing. Not bundled into the production SDK or the `libalg` library.
-- Redistribution: Any distribution of the derived files that includes Wikipedia titles or text snippets is subject to CC BY-SA 3.0 attribution requirements.
+### Intellectual Property & Data Scope
+- **Source Text:** The original text corpus from Simple English Wikipedia is licensed under CC BY-SA 3.0 / GFDL. In this repository, **all textual content, titles, and URLs were explicitly discarded** during extraction; only numerical identifiers (`row_id`, `external_id`) and float32 vectors are stored.
+- **Model:** `sentence-transformers/all-MiniLM-L6-v2` is licensed under the Apache License 2.0.
+- **Derived Arrays:** Binary float32 projections (`corpus.f32`, `queries.f32`) generated via IncrementalPCA used exclusively for testing recall and latency. They are not bundled into the distributed SDK.

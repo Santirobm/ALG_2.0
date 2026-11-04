@@ -1,7 +1,8 @@
 # Build script for ALG Vector Engine using Zig C++ on Windows
 param (
     [switch]$RunTests = $true,
-    [switch]$RunBenchmark = $false
+    [switch]$RunBenchmark = $false,
+    [switch]$Package = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +31,7 @@ $Inc = "-Iinclude", "-Isrc"
 Write-Host "[1/6] Compiling AVX2+FMA kernel..." -ForegroundColor Yellow
 & $ZIG c++ -O3 -std=c++17 -mavx2 -mfma $Inc -c src/kernels/simd_avx2.cpp -o "$BinDir/simd_avx2.o"
 
-# 2. Compile portable baseline sources
+# 2. Compile platform and core components
 Write-Host "[2/6] Compiling platform and core components..." -ForegroundColor Yellow
 & $ZIG c++ -O3 -std=c++17 $Inc -c src/kernels/simd_scalar.cpp -o "$BinDir/simd_scalar.o"
 & $ZIG c++ -O3 -std=c++17 $Inc -c src/platform/cpu_features.cpp -o "$BinDir/cpu_features.o"
@@ -74,4 +75,29 @@ if ($RunTests) {
 if ($RunBenchmark) {
     Write-Host "`n--- Running Benchmark Harness ---" -ForegroundColor Cyan
     & "$BinDir/alg_benchmark_cli.exe"
+}
+
+if ($Package) {
+    Write-Host "`n--- Packaging Third-Party SDK Distribution (dist/) ---" -ForegroundColor Cyan
+    $DistRoot = "dist/alg-vector-engine-sdk"
+    if (Test-Path $DistRoot) {
+        Remove-Item -Recurse -Force $DistRoot
+    }
+    New-Item -ItemType Directory -Force -Path "$DistRoot/include", "$DistRoot/lib/windows-x64", "$DistRoot/examples" | Out-Null
+
+    Copy-Item "include/alg_engine.h" -Destination "$DistRoot/include/alg_engine.h"
+    Copy-Item "$BinDir/alg.dll" -Destination "$DistRoot/lib/windows-x64/alg.dll"
+    Copy-Item "$BinDir/libalg_dll.a" -Destination "$DistRoot/lib/windows-x64/libalg_dll.a"
+    Copy-Item "$BinDir/libalg.a" -Destination "$DistRoot/lib/windows-x64/libalg.a"
+
+    Copy-Item "examples/c_example.c" -Destination "$DistRoot/examples/c_example.c"
+    Copy-Item "examples/cpp_example.cpp" -Destination "$DistRoot/examples/cpp_example.cpp"
+    Copy-Item "examples/CMakeLists.txt" -Destination "$DistRoot/examples/CMakeLists.txt"
+    Copy-Item "examples/build_examples.bat" -Destination "$DistRoot/examples/build_examples.bat"
+
+    Copy-Item "README.md" -Destination "$DistRoot/README.md"
+    Copy-Item "LICENSE" -Destination "$DistRoot/LICENSE"
+    Copy-Item "CHANGELOG.md" -Destination "$DistRoot/CHANGELOG.md"
+
+    Write-Host "SDK packaged cleanly at $DistRoot" -ForegroundColor Green
 }

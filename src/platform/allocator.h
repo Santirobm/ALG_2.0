@@ -22,6 +22,12 @@ void* alg_aligned_alloc_64(size_t bytes);
 void alg_aligned_free_64(void* ptr);
 
 /**
+ * Test hook to simulate OOM (out of memory).
+ */
+void alg_test_simulate_oom(int enable);
+bool alg_test_is_oom_simulated(void);
+
+/**
  * Safe multiplication of two size_t values.
  * Returns true if an overflow would occur, false otherwise.
  */

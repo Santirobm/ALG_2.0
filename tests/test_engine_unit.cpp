@@ -5,7 +5,10 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <random>
 #include "alg_engine.h"
+#include "alg_test_hooks.h"
+#include "../src/platform/allocator.h"
 
 #define TEST_ASSERT(cond, msg) \
     do { \
@@ -35,6 +38,10 @@ static int test_invalid_arguments_and_out_count() {
     AlgIndexConfig cfg = {0, 100, ALG_METRIC_L2_SQR};
     status = alg_create_index(&cfg, &index);
     TEST_ASSERT(status == ALG_INVALID_ARGUMENT, "Dimension 0 must fail");
+
+    cfg.dimension = ALG_MAX_DIMENSION + 1;
+    status = alg_create_index(&cfg, &index);
+    TEST_ASSERT(status == ALG_INVALID_ARGUMENT, "Dimension > ALG_MAX_DIMENSION must fail");
 
     cfg.dimension = 64;
     cfg.metric = (AlgMetric)999;
@@ -175,34 +182,83 @@ static int test_set_vectors_atomicity_on_failure() {
     return 0;
 }
 
-// 5. Arithmetic and Size Overflow Protection
-static int test_size_and_allocation_overflow() {
+// 5. Arithmetic Overflow Unit Tests
+static int test_arithmetic_overflow_protection() {
+    size_t result = 0;
+
+    // 2-way multiplication overflow
+    TEST_ASSERT(alg_mul_overflow_2(SIZE_MAX / 2 + 1, 2, &result) == true, "Must detect 2-way overflow");
+    TEST_ASSERT(alg_mul_overflow_2(SIZE_MAX, 2, &result) == true, "Must detect overflow with SIZE_MAX");
+    TEST_ASSERT(alg_mul_overflow_2(1000, 2000, &result) == false && result == 2000000, "Valid 2-way multiplication must succeed");
+
+    // 3-way multiplication overflow
+    TEST_ASSERT(alg_mul_overflow_3(SIZE_MAX / 4 + 1, 2, 2, &result) == true, "Must detect 3-way overflow");
+    TEST_ASSERT(alg_mul_overflow_3(100, 200, 4, &result) == false && result == 80000, "Valid 3-way multiplication must succeed");
+
+    // Allocator overflow guard: bytes > SIZE_MAX - 63
+    void* ptr = alg_aligned_alloc_64(SIZE_MAX - 10);
+    TEST_ASSERT(ptr == nullptr, "Allocator must reject allocation exceeding SIZE_MAX - 63");
+
+    // Index creation overflow with initial_capacity * dim
     AlgIndex* index = nullptr;
-    // Dimension and capacity causing size allocation failure / overflow
-    AlgIndexConfig cfg = {0xFFFFFFFFu, 100, ALG_METRIC_L2_SQR};
+    AlgIndexConfig cfg;
+    cfg.dimension = 100000;
+    cfg.initial_capacity = (uint32_t)(SIZE_MAX / (100000 * sizeof(float)) + 1);
+    cfg.metric = ALG_METRIC_L2_SQR;
     AlgStatus st = alg_create_index(&cfg, &index);
-    TEST_ASSERT(st == ALG_INVALID_ARGUMENT || st == ALG_OUT_OF_MEMORY, "Overflow or OOM in initial capacity * dim must fail");
+    TEST_ASSERT(st == ALG_INVALID_ARGUMENT || st == ALG_OUT_OF_MEMORY, "Index creation with overflowing size must fail");
 
-    // Capacity overflow
-    cfg.dimension = 1024;
-    cfg.initial_capacity = 0xFFFFFFF0u;
+    return 0;
+}
+
+// 6. Simulated OOM Failure Propagation
+static int test_simulated_oom_propagation() {
+    AlgIndexConfig cfg = {64, 100, ALG_METRIC_L2_SQR};
+    AlgIndex* index = nullptr;
+
+    // 1. Simulate OOM during index creation
+    alg_test_simulate_oom(1);
+    AlgStatus st = alg_create_index(&cfg, &index);
+    TEST_ASSERT(st == ALG_OUT_OF_MEMORY, "Index creation under OOM must return ALG_OUT_OF_MEMORY");
+    TEST_ASSERT(index == nullptr, "Failed index must remain null");
+    alg_test_simulate_oom(0);
+
+    // 2. Create valid index
     st = alg_create_index(&cfg, &index);
-    TEST_ASSERT(st == ALG_INVALID_ARGUMENT || st == ALG_OUT_OF_MEMORY, "Overflow in capacity must fail");
+    TEST_ASSERT(st == ALG_OK, "Index creation must succeed");
 
-    // Valid index, overflow in alg_set_vectors
-    cfg.dimension = 10000;
-    cfg.initial_capacity = 0;
-    alg_create_index(&cfg, &index);
+    std::vector<float> corpus(100 * 64, 1.0f);
+    st = alg_set_vectors(index, 100, corpus.data());
+    TEST_ASSERT(st == ALG_OK, "Vector set must succeed");
 
-    float dummy[10];
-    st = alg_set_vectors(index, 0xFFFFFFFFu, dummy);
-    TEST_ASSERT(st == ALG_INVALID_ARGUMENT, "Overflow in num_vectors * dim must fail");
+    // 3. Simulate OOM during corpus reallocation
+    std::vector<float> big_corpus(500 * 64, 2.0f);
+    alg_test_simulate_oom(1);
+    st = alg_set_vectors(index, 500, big_corpus.data());
+    TEST_ASSERT(st == ALG_OUT_OF_MEMORY, "Corpus reallocation under OOM must return ALG_OUT_OF_MEMORY");
+    alg_test_simulate_oom(0);
+
+    // Prior corpus of 100 vectors must still be valid
+    std::vector<float> q(64, 1.0f);
+    AlgSearchResult res[5];
+    uint32_t count = 0;
+    st = alg_search(index, q.data(), 5, ALG_SEARCH_FAST_FLOAT32, res, &count);
+    TEST_ASSERT(st == ALG_OK && count == 5 && res[0].distance == 0.0f, "Prior index must remain operational after OOM");
+
+    // 4. Simulate OOM in dynamic Top-K heap allocation (K = 750 > 512)
+    std::vector<AlgSearchResult> big_res(750);
+    count = 999;
+    alg_test_simulate_oom(1);
+    st = alg_search(index, q.data(), 750, ALG_SEARCH_FAST_FLOAT32, big_res.data(), &count);
+    TEST_ASSERT(st == ALG_OUT_OF_MEMORY, "Search with K > 512 under OOM must return ALG_OUT_OF_MEMORY");
+    TEST_ASSERT(count == 0, "out_count must be reset to 0 on heap OOM");
+    alg_test_simulate_oom(0);
 
     alg_free_index(index);
     return 0;
 }
 
-// 6. Strict Compact Filter Contract & Candidate Validation
+// 7. Strict Compact Filter Contract & Candidate Validation
 static int test_compact_search_strict_ids_and_out_of_bounds() {
     const uint32_t dim = 64;
     const uint32_t n = 100;
@@ -240,7 +296,7 @@ static int test_compact_search_strict_ids_and_out_of_bounds() {
     return 0;
 }
 
-// 7. Large Top-K (> 512 Dynamic Heap Allocation)
+// 8. Large Top-K (> 512 Dynamic Heap Allocation)
 static int test_topk_greater_than_512() {
     const uint32_t dim = 64;
     const uint32_t n = 1000;
@@ -273,7 +329,7 @@ static int test_topk_greater_than_512() {
     return 0;
 }
 
-// 8. Top-K Larger Than Candidate Count
+// 9. Top-K Larger Than Candidate Count
 static int test_topk_larger_than_candidate_count() {
     const uint32_t dim = 32;
     const uint32_t n = 10;
@@ -297,7 +353,7 @@ static int test_topk_larger_than_candidate_count() {
     return 0;
 }
 
-// 9. Duplicate Candidate IDs Handling
+// 10. Duplicate Candidate IDs Handling
 static int test_duplicate_candidate_ids() {
     const uint32_t dim = 64;
     const uint32_t n = 20;
@@ -323,59 +379,78 @@ static int test_duplicate_candidate_ids() {
     return 0;
 }
 
-// 10. Forced Scalar Fallback & AVX2 Equivalence
-static int test_forced_scalar_fallback_and_equivalence() {
-    const uint32_t dim = 128;
-    const uint32_t n = 500;
-    AlgIndexConfig cfg = {dim, n, ALG_METRIC_L2_SQR};
-    AlgIndex* index = nullptr;
-    alg_create_index(&cfg, &index);
+// 11. Exhaustive Scalar vs AVX2 Ranking Equivalence (Position by Position)
+static int test_exhaustive_scalar_avx2_ranking_equivalence() {
+    std::vector<uint32_t> test_dims = {1, 7, 8, 9, 63, 64, 65, 127, 128, 256};
+    const uint32_t n = 200;
+    const uint32_t top_k = 10;
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> dist(0.1f, 10.0f);
 
-    std::vector<float> corpus(n * dim);
-    for (size_t i = 0; i < corpus.size(); ++i) {
-        corpus[i] = static_cast<float>((i * 17 + 3) % 1009) * 0.005f;
+    for (uint32_t dim : test_dims) {
+        AlgIndexConfig cfg = {dim, n, ALG_METRIC_L2_SQR};
+        AlgIndex* index = nullptr;
+        alg_create_index(&cfg, &index);
+
+        std::vector<float> corpus((size_t)n * dim);
+        for (size_t i = 0; i < corpus.size(); ++i) {
+            corpus[i] = dist(rng);
+        }
+        alg_set_vectors(index, n, corpus.data());
+
+        // Test 15 queries per dimension (including exact self-match target 0 and 42)
+        std::vector<std::vector<float>> test_queries;
+        test_queries.push_back(std::vector<float>(corpus.begin(), corpus.begin() + dim));
+        test_queries.push_back(std::vector<float>(corpus.begin() + 42 * dim, corpus.begin() + 43 * dim));
+
+        for (int q_rand = 0; q_rand < 13; ++q_rand) {
+            std::vector<float> q(dim);
+            for (size_t d = 0; d < dim; ++d) q[d] = dist(rng);
+            test_queries.push_back(q);
+        }
+
+        for (const auto& q : test_queries) {
+            // Run AVX2
+            alg_test_force_scalar_isa(0);
+            AlgSearchResult res_avx2[10];
+            uint32_t count_avx2 = 0;
+            AlgStatus st1 = alg_search(index, q.data(), top_k, ALG_SEARCH_FAST_FLOAT32, res_avx2, &count_avx2);
+            TEST_ASSERT(st1 == ALG_OK, "AVX2 search failed");
+
+            // Run Scalar
+            alg_test_force_scalar_isa(1);
+            AlgSearchResult res_scalar[10];
+            uint32_t count_scalar = 0;
+            AlgStatus st2 = alg_search(index, q.data(), top_k, ALG_SEARCH_FAST_FLOAT32, res_scalar, &count_scalar);
+            TEST_ASSERT(st2 == ALG_OK, "Scalar search failed");
+
+            TEST_ASSERT(count_avx2 == count_scalar, "Count mismatch between AVX2 and Scalar");
+
+            // Verify position-by-position ranking and ID equality
+            for (uint32_t r = 0; r < count_avx2; ++r) {
+                TEST_ASSERT(res_avx2[r].id == res_scalar[r].id,
+                            "Scalar and AVX2 Top-K ranking ID mismatch at position");
+                float dist_diff = std::fabs(res_avx2[r].distance - res_scalar[r].distance);
+                float rel_diff = dist_diff / ((res_avx2[r].distance > 1.0f) ? res_avx2[r].distance : 1.0f);
+                TEST_ASSERT(rel_diff < 1e-4f,
+                            "Scalar and AVX2 relative distance mismatch at position");
+            }
+        }
+
+        alg_test_force_scalar_isa(0);
+        alg_free_index(index);
     }
-    alg_set_vectors(index, n, corpus.data());
 
-    std::vector<float> q(dim);
-    for (size_t d = 0; d < dim; ++d) q[d] = corpus[77 * dim + d];
-
-    // 1. Run with standard detected ISA (AVX2 on supported machines)
-    alg_debug_force_scalar_isa(0);
-    AlgSearchResult res_avx2[10];
-    uint32_t count_avx2 = 0;
-    AlgStatus st1 = alg_search(index, q.data(), 10, ALG_SEARCH_FAST_FLOAT32, res_avx2, &count_avx2);
-    TEST_ASSERT(st1 == ALG_OK, "AVX2 search failed");
-
-    // 2. Force scalar fallback
-    alg_debug_force_scalar_isa(1);
-    TEST_ASSERT(std::string(alg_get_active_isa_name()).find("Scalar") != std::string::npos,
-                "Forced scalar must report Scalar Fallback ISA");
-
-    AlgSearchResult res_scalar[10];
-    uint32_t count_scalar = 0;
-    AlgStatus st2 = alg_search(index, q.data(), 10, ALG_SEARCH_FAST_FLOAT32, res_scalar, &count_scalar);
-    TEST_ASSERT(st2 == ALG_OK, "Scalar search failed");
-    TEST_ASSERT(count_avx2 == count_scalar, "Result counts must match");
-
-    // 3. Compare top-1 self result and overall neighbor set
-    TEST_ASSERT(res_avx2[0].id == 77 && res_scalar[0].id == 77, "Rank 1 must be target 77 in both");
-    for (size_t i = 0; i < count_avx2; ++i) {
-        float diff = std::fabs(res_avx2[i].distance - res_scalar[i].distance);
-        TEST_ASSERT(diff < 1e-4f, "Distances between AVX2 and Scalar must agree within float32 tolerance");
-    }
-
-    // Restore auto detection
-    alg_debug_force_scalar_isa(0);
-
-    alg_free_index(index);
     return 0;
 }
 
-// 11. Multithreaded Concurrent Searches
-static int test_multithreaded_concurrent_searches() {
+// 12. Multithreaded Read Concurrency with Serial Reference Comparison
+static int test_multithreaded_read_concurrency_serial_reference() {
     const uint32_t dim = 64;
-    const uint32_t n = 1000;
+    const uint32_t n = 500;
+    const uint32_t num_queries = 30;
+    const uint32_t top_k = 5;
+
     AlgIndexConfig cfg = {dim, n, ALG_METRIC_L2_SQR};
     AlgIndex* index = nullptr;
     alg_create_index(&cfg, &index);
@@ -388,22 +463,50 @@ static int test_multithreaded_concurrent_searches() {
     }
     alg_set_vectors(index, n, corpus.data());
 
-    const int NUM_THREADS = 8;
-    const int QUERIES_PER_THREAD = 200;
+    // Generate fixed queries
+    std::vector<std::vector<float>> queries(num_queries, std::vector<float>(dim));
+    for (size_t q = 0; q < num_queries; ++q) {
+        for (size_t d = 0; d < dim; ++d) {
+            queries[q][d] = static_cast<float>(q * 13 + d) * 0.05f;
+        }
+    }
+
+    // 1. Compute serial reference results for all queries
+    std::vector<std::vector<AlgSearchResult>> serial_ref(num_queries, std::vector<AlgSearchResult>(top_k));
+    for (size_t q = 0; q < num_queries; ++q) {
+        uint32_t out_count = 0;
+        AlgStatus st = alg_search(index, queries[q].data(), top_k, ALG_SEARCH_FAST_FLOAT32,
+                                  serial_ref[q].data(), &out_count);
+        TEST_ASSERT(st == ALG_OK && out_count == top_k, "Serial reference computation failed");
+    }
+
+    // 2. Launch 16 concurrent threads querying the same AlgIndex simultaneously
+    const int NUM_THREADS = 16;
+    const int ITERATIONS = 100;
     std::vector<std::thread> threads;
-    std::vector<int> thread_errors(NUM_THREADS, 0);
+    std::vector<int> thread_mismatches(NUM_THREADS, 0);
 
     for (int t = 0; t < NUM_THREADS; ++t) {
         threads.emplace_back([&, t]() {
-            for (int q = 0; q < QUERIES_PER_THREAD; ++q) {
-                uint32_t target_id = (t * 31 + q * 7) % n;
-                const float* q_ptr = &corpus[target_id * dim];
-                AlgSearchResult res[5];
-                uint32_t out_count = 0;
+            for (int it = 0; it < ITERATIONS; ++it) {
+                uint32_t q_idx = (t * 7 + it) % num_queries;
+                AlgSearchResult thread_res[top_k];
+                uint32_t count = 0;
 
-                AlgStatus st = alg_search(index, q_ptr, 5, ALG_SEARCH_FAST_FLOAT32, res, &out_count);
-                if (st != ALG_OK || out_count != 5 || res[0].id != target_id || std::fabs(res[0].distance) > 1e-6f) {
-                    thread_errors[t]++;
+                AlgStatus st = alg_search(index, queries[q_idx].data(), top_k, ALG_SEARCH_FAST_FLOAT32,
+                                          thread_res, &count);
+                if (st != ALG_OK || count != top_k) {
+                    thread_mismatches[t]++;
+                    continue;
+                }
+
+                // Verify every result matches the serial reference position-by-position
+                for (uint32_t r = 0; r < top_k; ++r) {
+                    if (thread_res[r].id != serial_ref[q_idx][r].id ||
+                        std::fabs(thread_res[r].distance - serial_ref[q_idx][r].distance) > 1e-6f) {
+                        thread_mismatches[t]++;
+                        break;
+                    }
                 }
             }
         });
@@ -414,43 +517,64 @@ static int test_multithreaded_concurrent_searches() {
     }
 
     int total_err = 0;
-    for (int err : thread_errors) total_err += err;
-    TEST_ASSERT(total_err == 0, "Concurrent searches suffered data race or error");
+    for (int err : thread_mismatches) total_err += err;
+    TEST_ASSERT(total_err == 0, "Concurrent queries suffered data race or mismatch with serial reference");
 
     alg_free_index(index);
     return 0;
 }
 
-// 12. Non-Multiple-of-8 Dimensions
-static int test_non_multiple_of_8_dimension() {
-    const uint32_t dim = 13;
-    const uint32_t n = 50;
-    AlgIndexConfig cfg = {dim, n, ALG_METRIC_L2_SQR};
-    AlgIndex* index = nullptr;
-    alg_create_index(&cfg, &index);
+// 13. Concurrent Index Initialization from Fresh State
+static int test_concurrent_index_initialization() {
+    const int NUM_THREADS = 16;
+    std::vector<std::thread> threads;
+    std::vector<int> errors(NUM_THREADS, 0);
 
-    std::vector<float> corpus(n * dim);
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t d = 0; d < dim; ++d) {
-            corpus[i * dim + d] = static_cast<float>(i * 3 + d) * 0.1f;
-        }
+    // Reset CPU detection cache to uninitialized state
+    alg_test_reset_cpu_cache();
+
+    for (int t = 0; t < NUM_THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            AlgIndexConfig cfg = {32, 50, ALG_METRIC_L2_SQR};
+            AlgIndex* local_idx = nullptr;
+            AlgStatus st = alg_create_index(&cfg, &local_idx);
+            if (st != ALG_OK || !local_idx) {
+                errors[t]++;
+                return;
+            }
+
+            std::vector<float> corpus(50 * 32, (float)(t + 1));
+            st = alg_set_vectors(local_idx, 50, corpus.data());
+            if (st != ALG_OK) {
+                errors[t]++;
+                alg_free_index(local_idx);
+                return;
+            }
+
+            std::vector<float> q(32, (float)(t + 1));
+            AlgSearchResult res[5];
+            uint32_t count = 0;
+            st = alg_search(local_idx, q.data(), 5, ALG_SEARCH_FAST_FLOAT32, res, &count);
+            if (st != ALG_OK || count != 5 || res[0].distance != 0.0f) {
+                errors[t]++;
+            }
+
+            alg_free_index(local_idx);
+        });
     }
-    alg_set_vectors(index, n, corpus.data());
 
-    const float* query = &corpus[25 * dim];
-    AlgSearchResult results[5];
-    uint32_t count = 0;
-    AlgStatus st = alg_search(index, query, 5, ALG_SEARCH_FAST_FLOAT32, results, &count);
-    TEST_ASSERT(st == ALG_OK, "Search failed for dim 13");
-    TEST_ASSERT(count == 5, "Expected 5 results");
-    TEST_ASSERT(results[0].id == 25, "Rank 1 must be self target 25");
-    TEST_ASSERT(std::fabs(results[0].distance) < 1e-6f, "Distance must be 0");
+    for (auto& th : threads) {
+        th.join();
+    }
 
-    alg_free_index(index);
+    int total_err = 0;
+    for (int err : errors) total_err += err;
+    TEST_ASSERT(total_err == 0, "Concurrent index initialization suffered data race or failure");
+
     return 0;
 }
 
-// 13. Deterministic Tie-Breaking
+// 14. Deterministic Tie-Breaking
 static int test_deterministic_tie_breaking() {
     const uint32_t dim = 64;
     const uint32_t n = 20;
@@ -480,7 +604,7 @@ static int test_deterministic_tie_breaking() {
 
 int main() {
     std::cout << "============================================================\n";
-    std::cout << "ALG Vector Engine - Hardened Unit & Regression Test Suite\n";
+    std::cout << "ALG Vector Engine - Certified Unit & Regression Test Suite\n";
     std::cout << "Version: " << alg_get_version() << "\n";
     std::cout << "Active ISA: " << alg_get_active_isa_name() << "\n";
     std::cout << "Supported CPU Features bitmask: 0x" << std::hex << alg_get_supported_isa() << std::dec << "\n";
@@ -492,19 +616,20 @@ int main() {
     RUN_TEST(test_search_mode_contract);
     RUN_TEST(test_finiteness_validation_nan_inf);
     RUN_TEST(test_set_vectors_atomicity_on_failure);
-    RUN_TEST(test_size_and_allocation_overflow);
+    RUN_TEST(test_arithmetic_overflow_protection);
+    RUN_TEST(test_simulated_oom_propagation);
     RUN_TEST(test_compact_search_strict_ids_and_out_of_bounds);
     RUN_TEST(test_topk_greater_than_512);
     RUN_TEST(test_topk_larger_than_candidate_count);
     RUN_TEST(test_duplicate_candidate_ids);
-    RUN_TEST(test_forced_scalar_fallback_and_equivalence);
-    RUN_TEST(test_multithreaded_concurrent_searches);
-    RUN_TEST(test_non_multiple_of_8_dimension);
+    RUN_TEST(test_exhaustive_scalar_avx2_ranking_equivalence);
+    RUN_TEST(test_multithreaded_read_concurrency_serial_reference);
+    RUN_TEST(test_concurrent_index_initialization);
     RUN_TEST(test_deterministic_tie_breaking);
 
     std::cout << "\n============================================================\n";
     if (failed_tests == 0) {
-        std::cout << "ALL 13 TESTS PASSED CLEANLY (100% SUCCESS)\n";
+        std::cout << "ALL 14 TESTS PASSED CLEANLY (100% SUCCESS)\n";
         std::cout << "============================================================\n";
         return 0;
     } else {

@@ -29,6 +29,20 @@
  * 2. Mode ALG_SEARCH_EXACT_TOPK:
  *    - Reserved for future multi-pass uncertainty-band refinement.
  *    - In current release, returns ALG_INVALID_ARGUMENT.
+ *
+ * THREAD SAFETY CONTRACT:
+ * -----------------------
+ * - Read-only queries (alg_search, alg_search_compact, alg_search_buffer) are completely
+ *   thread-safe when executed concurrently by multiple threads on the same AlgIndex instance.
+ * - Index lifecycle functions (alg_set_vectors, alg_free_index) mutate internal memory and
+ *   must NOT be called concurrently with searches or other mutations on the same instance.
+ *
+ * DUPLICATE CANDIDATE IDS POLICY:
+ * -------------------------------
+ * - In alg_search_compact and alg_search_buffer, candidate ID lists are processed sequentially
+ *   as supplied. If eligible_ids contains duplicate IDs, each candidate instance is evaluated
+ *   independently and may appear multiple times in the Top-K results. Consumers desiring
+ *   deduplication should ensure the candidate ID array contains unique identifiers.
  */
 
 #ifndef ALG_ENGINE_H
@@ -56,6 +70,9 @@ extern "C" {
         #define ALG_API
     #endif
 #endif
+
+/** Maximum supported vector dimension */
+#define ALG_MAX_DIMENSION 1048576u
 
 /**
  * Status and error return codes.
@@ -105,7 +122,7 @@ typedef struct AlgSearchResult {
  * Configuration for index initialization.
  */
 typedef struct AlgIndexConfig {
-    uint32_t dimension;        /**< Vector dimension (must be > 0; optimal performance when multiple of 8) */
+    uint32_t dimension;        /**< Vector dimension (1 <= dimension <= ALG_MAX_DIMENSION) */
     uint32_t initial_capacity; /**< Pre-allocated vector count capacity (0 for default auto-grow) */
     AlgMetric metric;          /**< Distance metric (must be ALG_METRIC_L2_SQR) */
 } AlgIndexConfig;
@@ -248,12 +265,6 @@ ALG_API const char* alg_get_active_isa_name(void);
  * Return library version string.
  */
 ALG_API const char* alg_get_version(void);
-
-/**
- * Debug / Testing API: Force the engine to use scalar fallback even on CPUs with AVX2.
- * Pass 1 to force scalar fallback, or 0 to restore automatic ISA detection.
- */
-ALG_API void alg_debug_force_scalar_isa(int force);
 
 #ifdef __cplusplus
 }

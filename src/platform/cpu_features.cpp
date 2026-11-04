@@ -123,6 +123,11 @@ void alg_platform_set_force_scalar(bool force) {
     g_force_scalar.store(force, std::memory_order_seq_cst);
 }
 
-void alg_debug_force_scalar_isa(int force) {
+void alg_test_reset_cpu_cache(void) {
+    g_cached_features.store(0xFFFFFFFFu, std::memory_order_seq_cst);
+    g_force_scalar.store(false, std::memory_order_seq_cst);
+}
+
+void alg_test_force_scalar_isa(int force) {
     alg_platform_set_force_scalar(force != 0);
 }

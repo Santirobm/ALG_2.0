@@ -1,12 +1,27 @@
 #include "allocator.h"
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 
 #if defined(_WIN32)
 #include <malloc.h>
 #endif
 
+static std::atomic<bool> g_simulate_oom{false};
+
+void alg_test_simulate_oom(int enable) {
+    g_simulate_oom.store(enable != 0, std::memory_order_seq_cst);
+}
+
+bool alg_test_is_oom_simulated(void) {
+    return g_simulate_oom.load(std::memory_order_relaxed);
+}
+
 void* alg_aligned_alloc_64(size_t bytes) {
+    if (g_simulate_oom.load(std::memory_order_relaxed)) {
+        return NULL;
+    }
+
     if (bytes == 0) bytes = 64;
 
     // Arithmetic overflow protection on bytes + 63

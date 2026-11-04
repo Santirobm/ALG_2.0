@@ -1,6 +1,7 @@
 # Binaries and build artifacts
 bin/
 build/
+dist/
 *.exe
 *.pdb
 *.obj

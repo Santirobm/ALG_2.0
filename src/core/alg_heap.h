@@ -2,6 +2,7 @@
 #define ALG_CORE_ALG_HEAP_H
 
 #include "../../include/alg_engine.h"
+#include "../platform/allocator.h"
 #include <float.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,10 @@ static inline AlgStatus alg_heap_init(AlgTopKHeap* heap, uint32_t target_k) {
     } else {
         // Overflow check on allocation size
         if ((size_t)target_k > SIZE_MAX / sizeof(AlgSearchResult)) {
+            heap->data = NULL;
+            return ALG_OUT_OF_MEMORY;
+        }
+        if (alg_test_is_oom_simulated()) {
             heap->data = NULL;
             return ALG_OUT_OF_MEMORY;
         }

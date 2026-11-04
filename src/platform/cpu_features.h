@@ -13,6 +13,8 @@ bool alg_platform_has_avx2(void);
 bool alg_platform_has_fma(void);
 const char* alg_platform_get_isa_string(void);
 void alg_platform_set_force_scalar(bool force);
+void alg_test_reset_cpu_cache(void);
+void alg_test_force_scalar_isa(int force);
 
 #ifdef __cplusplus
 }

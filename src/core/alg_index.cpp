@@ -24,7 +24,7 @@ AlgStatus alg_create_index(const AlgIndexConfig* config, AlgIndex** out_index) {
     if (!config || !out_index) {
         return ALG_INVALID_ARGUMENT;
     }
-    if (config->dimension == 0) {
+    if (config->dimension == 0 || config->dimension > ALG_MAX_DIMENSION) {
         return ALG_INVALID_ARGUMENT;
     }
     if (config->metric != ALG_METRIC_L2_SQR) {

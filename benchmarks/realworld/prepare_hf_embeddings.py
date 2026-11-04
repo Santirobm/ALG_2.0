@@ -206,7 +206,7 @@ def main() -> int:
             "format": "ALG-HITO3.3-F32-ROWMAJOR-v1",
             "dataset": args.dataset,
             "dataset_commit": args.revision,
-            "dataset_download_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "export_command": export_cmd,
             "config": args.config,
             "source_split": args.split,

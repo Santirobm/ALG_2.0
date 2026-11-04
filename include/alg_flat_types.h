@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #ifndef ALG_FLAT_TYPES_H
 #define ALG_FLAT_TYPES_H
 

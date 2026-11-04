@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #include "../benchmarks/faiss_comparison/faiss_c_shim.h"
 #include "../include/alg_flat_types.h"
 #include <iostream>

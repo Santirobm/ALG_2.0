@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 /**
  * @file alg_test_hooks.h
  * @brief Internal Testing & Diagnostic Hooks for ALG Vector Engine

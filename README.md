@@ -44,6 +44,12 @@ Corpus: 100,000 vectores sinteticos, 200 consultas, Top-10:
 
 En conjuntos reducidos (1,000 a 10,000 vectores), las latencias inferiores a 100 microsegundos permiten realizar miles de consultas por segundo por nucleo sin saturar el sistema anfitrion.
 
+### Alcance y condiciones de rendimiento
+
+La ventaja operativa de ALG Vector Engine se concentra en escenarios de busqueda filtrada con selectividad media y alta (donde los candidatos elegibles son compactados en memoria contigua), permitiendo que el kernel SIMD AVX2+FMA y la estructura Top-K operen en microsegundos sin sobrecarga de runtime.
+
+En escenarios de barrido completo sin filtros sobre corpus masivos (100% de candidatos sobre millones de vectores), el rendimiento queda gobernado principalmente por el ancho de banda de memoria principal (DRAM) y converge con implementaciones BLAS multihilo. Por ello, el diseno de la biblioteca esta orientado especificamente a cargas donde la similitud vectorial coexiste con filtros relacionales o procesamiento embebido en memoria de baja latencia.
+
 ## Ejemplo de uso en C
 
 ```c

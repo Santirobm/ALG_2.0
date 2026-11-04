@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #include "allocator.h"
 #include <stdlib.h>
 #include <string.h>

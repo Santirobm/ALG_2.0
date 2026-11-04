@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #ifndef ALG_CORE_ALG_INDEX_H
 #define ALG_CORE_ALG_INDEX_H
 

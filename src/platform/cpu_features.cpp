@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #include "cpu_features.h"
 #include "../../include/alg_engine.h"
 #include <atomic>

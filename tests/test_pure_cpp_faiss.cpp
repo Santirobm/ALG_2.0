@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 // test_pure_cpp_faiss.cpp
 #include <iostream>
 #include <cstdint>

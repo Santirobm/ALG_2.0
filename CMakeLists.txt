@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Santiago Robledo.
+# SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.14)
 project(alg_vector_engine VERSION 1.0.0 LANGUAGES C CXX)
 

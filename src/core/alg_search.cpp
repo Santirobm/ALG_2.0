@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #include "alg_search.h"
 #include "../platform/allocator.h"
 #include <string.h>

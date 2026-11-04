@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Santiago Robledo.
+# SPDX-License-Identifier: Apache-2.0
 # Build script for ALG Vector Engine (Windows x64 & Linux x64 Cross-Compilation)
 param (
     [switch]$RunTests = $true,
@@ -124,6 +126,8 @@ if ($Package) {
     # Metadata & documentation
     Copy-Item "README.md" -Destination "$DistRoot/README.md"
     Copy-Item "LICENSE" -Destination "$DistRoot/LICENSE"
+    Copy-Item "AUTHORS.md" -Destination "$DistRoot/AUTHORS.md"
+    Copy-Item "THIRD_PARTY_NOTICES.md" -Destination "$DistRoot/THIRD_PARTY_NOTICES.md"
     Copy-Item "CHANGELOG.md" -Destination "$DistRoot/CHANGELOG.md"
 
     Write-Host "Multi-Platform SDK packaged cleanly at $DistRoot" -ForegroundColor Green

@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 /**
  * @file alg_engine.h
  * @brief ALG Vector Engine - High Performance Filtered Vector Search Library

@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #ifndef ALG_FLAT_PHYSICAL_LAYOUTS_H
 #define ALG_FLAT_PHYSICAL_LAYOUTS_H
 

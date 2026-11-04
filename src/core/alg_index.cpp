@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Santiago Robledo.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #include "alg_index.h"
 #include "../platform/cpu_features.h"
 #include "../platform/allocator.h"

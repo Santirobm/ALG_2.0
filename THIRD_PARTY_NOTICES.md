@@ -11,8 +11,9 @@ The standalone core library (`libalg`) does not link against, include, or depend
 - Directory: `third_party/faiss/`
 - Documentation: `third_party/faiss/README.md`
 - Upstream Repository: https://github.com/facebookresearch/faiss
-- Release Tag: [`v1.15.1`](https://github.com/facebookresearch/faiss/releases/tag/v1.15.1) (Release date: September 15, 2026)
-- Upstream Commit Hash: `3bb4864b2260683416a49db21ebcb66b0a94464c`
+- Release Tag: [`v1.15.1`](https://github.com/facebookresearch/faiss/releases/tag/v1.15.1)
+- Release Date: September 15, 2026
+- Upstream Tag Commit SHA: `75c755c5a1fc854756aaf3bd1131213aeb21d8d1`
 - License: MIT License (Meta Platforms, Inc. and affiliates)
 - Purpose: Benchmarking, comparative baseline measurements, and numerical equivalence verification in `benchmarks/faiss_comparison/` and `tests/`.
 
@@ -56,7 +57,20 @@ SOFTWARE.
 - Download Timestamp: `2026-11-03T16:05:00-03:00`
 - Purpose: Real-world vector distribution validation across research and historical ablation benchmarks (Milestones 3.2 and 3.3).
 
+### Reproducible Export Command
+```bash
+python benchmarks/realworld/prepare_hf_embeddings.py \
+  --dataset lsb/simplewiki2023-all-minilm-l6-v2-embedding \
+  --id-column id_int \
+  --rows 100000 \
+  --query-fraction 0.10 \
+  --seed 3303 \
+  --dimensions 32,64,128,256 \
+  --output data/hito3_3
+```
+
 ### Intellectual Property & Data Scope
-- **Source Text:** The original text corpus from Simple English Wikipedia is licensed under CC BY-SA 3.0 / GFDL. In this repository, **all textual content, titles, and URLs were explicitly discarded** during extraction; only numerical identifiers (`row_id`, `external_id`) and float32 vectors are stored.
+- **Data Scope:** The exported fixtures do not contain source article text, titles, or URLs. They retain numerical embeddings derived from the upstream dataset. The licensing status of derived embeddings should be assessed separately from the licensing of the original textual content.
+- **Source Text:** The underlying text from Simple English Wikipedia is licensed under CC BY-SA 3.0 / GFDL.
 - **Model:** `sentence-transformers/all-MiniLM-L6-v2` is licensed under the Apache License 2.0.
-- **Derived Arrays:** Binary float32 projections (`corpus.f32`, `queries.f32`) generated via IncrementalPCA used exclusively for testing recall and latency. They are not bundled into the distributed SDK.
+- **Derived Arrays:** Binary float32 projections (`corpus.f32`, `queries.f32`) generated via IncrementalPCA used exclusively for testing recall and latency. They are excluded from git distribution and are not bundled into the distributed SDK.

@@ -9,8 +9,9 @@ The standalone production engine (`libalg.a`, `alg.dll`, `libalg.so`) and the di
 ## Provenance and Version Metadata
 
 - **Upstream Repository:** https://github.com/facebookresearch/faiss
-- **Release Tag:** [`v1.15.1`](https://github.com/facebookresearch/faiss/releases/tag/v1.15.1) (Release date: September 15, 2026)
-- **Upstream Commit Hash:** `3bb4864b2260683416a49db21ebcb66b0a94464c`
+- **Release Tag:** [`v1.15.1`](https://github.com/facebookresearch/faiss/releases/tag/v1.15.1)
+- **Release Date:** September 15, 2026
+- **Upstream Tag Commit SHA:** `75c755c5a1fc854756aaf3bd1131213aeb21d8d1`
 - **Internal Version Macros:** `FAISS_VERSION_MAJOR 1`, `FAISS_VERSION_MINOR 15`, `FAISS_VERSION_PATCH 1` (verified in `include/faiss/Index.h`)
 - **License:** MIT License (Meta Platforms, Inc. and affiliates). Full text in `LICENSE`.
 
@@ -22,7 +23,7 @@ The standalone production engine (`libalg.a`, `alg.dll`, `libalg.so`) and the di
 | :--- | :--- | :--- |
 | `faiss.def` | Module definition file (8,138 exported C++ symbols) | `E9437311BDD3640A155A7AE3C3C2EA492FA9EDF0AEFD02AEE51D4578C380ECB8` |
 | `faiss.lib` | Windows x64 MSVC import library (stub for `faiss.dll`) | `A089148BC1294A2B78DCA4DEA5B7266C1198E4E6AAB3DC644EAB28883607EE12` |
-| `include/faiss/` | C++ header tree from upstream tag `v1.15.1` | Matching upstream commit `3bb4864` |
+| `include/faiss/` | C++ header tree from upstream tag `v1.15.1` | Matching upstream tag commit `75c755c` |
 
 ---
 

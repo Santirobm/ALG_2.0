@@ -20,6 +20,14 @@ extern "C" {
         int64_t* labels,
         const void* params) asm("?search@IndexFlat@faiss@@UEBAX_JPEBM0PEAMPEA_JPEBUSearchParameters@2@@Z");
 
+    void faiss_IndexFlat_compute_distance_subset(
+        const void* this_ptr,
+        int64_t n,
+        const float* x,
+        int64_t k,
+        float* distances,
+        const int64_t* labels) asm("?compute_distance_subset@IndexFlat@faiss@@QEBAX_JPEBM0PEAMPEB_J@Z");
+
     void faiss_IndexIVF_search(
         const void* this_ptr,
         int64_t n,
@@ -372,4 +380,23 @@ int faiss_shim_search_ivf(
 
     faiss_IndexIVF_search(ctx->raw_index, n_queries, queries, k, out_distances, out_labels, raw_p);
     return 0;
+}
+
+void faiss_shim_compute_distance_subset(
+    FaissFlatHandle handle,
+    uint32_t n_queries,
+    const float* queries,
+    uint32_t k_subset,
+    float* out_distances,
+    const int64_t* subset_labels) {
+
+    if (!handle || !queries || !out_distances || !subset_labels || k_subset == 0) return;
+    FaissFlatContext* ctx = reinterpret_cast<FaissFlatContext*>(handle);
+    faiss_IndexFlat_compute_distance_subset(
+        ctx->raw_index,
+        static_cast<int64_t>(n_queries),
+        queries,
+        static_cast<int64_t>(k_subset),
+        out_distances,
+        subset_labels);
 }

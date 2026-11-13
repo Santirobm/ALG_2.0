@@ -46,6 +46,14 @@ int faiss_shim_search_flat(
     int64_t* out_labels,
     FaissParamsHandle params);
 
+void faiss_shim_compute_distance_subset(
+    FaissFlatHandle handle,
+    uint32_t n_queries,
+    const float* queries,
+    uint32_t k_subset,
+    float* out_distances,
+    const int64_t* subset_labels);
+
 int faiss_shim_search_ivf(
     FaissIVFHandle handle,
     uint32_t n_queries,
